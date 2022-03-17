@@ -362,8 +362,6 @@ htmlhelp_basename = "SQLAlchemydoc"
 
 # Grouping the document tree into LaTeX files. List of tuples (source start
 # file, target name, title, author, documentclass [howto/manual]).
-
-"""
 latex_documents = [
     (
         "contents",
@@ -373,7 +371,6 @@ latex_documents = [
         "manual",
     )
 ]
-"""
 
 # The name of an image file (relative to this directory) to place at the top of
 # the title page.
@@ -391,7 +388,7 @@ latex_documents = [
 
 # Additional stuff for the LaTeX preamble.
 # sets TOC depth to 2.
-# latex_preamble = r"\setcounter{tocdepth}{3}"
+latex_preamble = r"\setcounter{tocdepth}{3}"
 
 # Documents to append as an appendix to all manuals.
 # latex_appendices = []
@@ -408,8 +405,6 @@ latex_documents = [
 
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
-
-"""
 man_pages = [
     (
         "index",
@@ -419,7 +414,7 @@ man_pages = [
         1,
     )
 ]
-"""
+
 
 # -- Options for Epub output -------------------------------------------------
 
