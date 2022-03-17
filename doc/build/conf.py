@@ -363,15 +363,17 @@ htmlhelp_basename = "SQLAlchemydoc"
 # Grouping the document tree into LaTeX files. List of tuples (source start
 # file, target name, title, author, documentclass [howto/manual]).
 
+"""
 latex_documents = [
     (
-#        "contents",
-#        "sqlalchemy_%s.tex" % release.replace(".", "_"),
-#        "SQLAlchemy Documentation",
-#        "Mike Bayer",
-#        "manual",
+        "contents",
+        "sqlalchemy_%s.tex" % release.replace(".", "_"),
+        "SQLAlchemy Documentation",
+        "Mike Bayer",
+        "manual",
     )
 ]
+"""
 
 # The name of an image file (relative to this directory) to place at the top of
 # the title page.
@@ -407,15 +409,17 @@ latex_documents = [
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
 
+"""
 man_pages = [
     (
-#        "index",
-#        "sqlalchemy",
-#        "SQLAlchemy Documentation",
-#        ["SQLAlchemy authors"],
-#        1,
+        "index",
+        "sqlalchemy",
+        "SQLAlchemy Documentation",
+        ["SQLAlchemy authors"],
+        1,
     )
 ]
+"""
 
 # -- Options for Epub output -------------------------------------------------
 
