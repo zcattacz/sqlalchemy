@@ -12,6 +12,7 @@ from itertools import zip_longest
 import typing
 from typing import Any
 from typing import Dict
+from typing import Iterable
 from typing import Iterator
 from typing import List
 from typing import MutableMapping
@@ -36,7 +37,6 @@ if typing.TYPE_CHECKING:
     from .elements import BindParameter
     from .elements import ClauseElement
     from .visitors import _TraverseInternalsType
-    from ..engine.base import _CompiledCacheType
     from ..engine.interfaces import _CoreSingleExecuteParams
 
 
@@ -52,6 +52,11 @@ class CacheConst(enum.Enum):
 
 
 NO_CACHE = CacheConst.NO_CACHE
+
+
+_CacheKeyTraversalType = Union[
+    "_TraverseInternalsType", Literal[CacheConst.NO_CACHE], Literal[None]
+]
 
 
 class CacheTraverseTarget(enum.Enum):
@@ -89,9 +94,7 @@ class HasCacheKey:
 
     __slots__ = ()
 
-    _cache_key_traversal: Union[
-        _TraverseInternalsType, Literal[CacheConst.NO_CACHE], Literal[None]
-    ] = NO_CACHE
+    _cache_key_traversal: _CacheKeyTraversalType = NO_CACHE
 
     _is_has_cache_key = True
 
@@ -99,8 +102,8 @@ class HasCacheKey:
     """private attribute which may be set to False to prevent the
     inherit_cache warning from being emitted for a hierarchy of subclasses.
 
-    Currently applies to the DDLElement hierarchy which does not implement
-    caching.
+    Currently applies to the :class:`.ExecutableDDLElement` hierarchy which
+    does not implement caching.
 
     """
 
@@ -269,7 +272,7 @@ class HasCacheKey:
                 elif meth is ANON_NAME:
                     elements = util.preloaded.sql_elements
                     if isinstance(obj, elements._anonymous_label):
-                        obj = obj.apply_map(anon_map)
+                        obj = obj.apply_map(anon_map)  # type: ignore
                     result += (attrname, obj)
                 elif meth is CALL_GEN_CACHE_KEY:
                     result += (
@@ -387,6 +390,13 @@ class MemoizedHasCacheKey(HasCacheKey, HasMemoized):
 
     @HasMemoized.memoized_instancemethod
     def _generate_cache_key(self) -> Optional[CacheKey]:
+        return HasCacheKey._generate_cache_key(self)
+
+
+class SlotsMemoizedHasCacheKey(HasCacheKey, util.MemoizedSlots):
+    __slots__ = ()
+
+    def _memoized_method__generate_cache_key(self) -> Optional[CacheKey]:
         return HasCacheKey._generate_cache_key(self)
 
 
@@ -535,6 +545,43 @@ class CacheKey(NamedTuple):
         }
 
         return target_element.params(translate)
+
+
+def _ad_hoc_cache_key_from_args(
+    tokens: Tuple[Any, ...],
+    traverse_args: Iterable[Tuple[str, InternalTraversal]],
+    args: Iterable[Any],
+) -> Tuple[Any, ...]:
+    """a quick cache key generator used by reflection.flexi_cache."""
+    bindparams: List[BindParameter[Any]] = []
+
+    _anon_map = anon_map()
+
+    tup = tokens
+
+    for (attrname, sym), arg in zip(traverse_args, args):
+        key = sym.name
+        visit_key = key.replace("dp_", "visit_")
+
+        if arg is None:
+            tup += (attrname, None)
+            continue
+
+        meth = getattr(_cache_key_traversal_visitor, visit_key)
+        if meth is CACHE_IN_PLACE:
+            tup += (attrname, arg)
+        elif meth in (
+            CALL_GEN_CACHE_KEY,
+            STATIC_CACHE_KEY,
+            ANON_NAME,
+            PROPAGATE_ATTRS,
+        ):
+            raise NotImplementedError(
+                f"Haven't implemented symbol {meth} for ad-hoc key from args"
+            )
+        else:
+            tup += meth(attrname, arg, None, _anon_map, bindparams)
+    return tup
 
 
 class _CacheKeyTraversal(HasTraversalDispatch):

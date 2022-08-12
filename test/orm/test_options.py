@@ -11,7 +11,6 @@ from sqlalchemy import Table
 from sqlalchemy import testing
 from sqlalchemy.orm import aliased
 from sqlalchemy.orm import attributes
-from sqlalchemy.orm import class_mapper
 from sqlalchemy.orm import column_property
 from sqlalchemy.orm import contains_eager
 from sqlalchemy.orm import defaultload
@@ -20,6 +19,7 @@ from sqlalchemy.orm import exc as orm_exc
 from sqlalchemy.orm import joinedload
 from sqlalchemy.orm import Load
 from sqlalchemy.orm import load_only
+from sqlalchemy.orm import loading
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm import strategy_options
 from sqlalchemy.orm import subqueryload
@@ -82,8 +82,7 @@ class PathTest:
         r = []
         for i, item in enumerate(path):
             if i % 2 == 0:
-                if isinstance(item, type):
-                    item = class_mapper(item)
+                item = inspect(item)
             else:
                 if isinstance(item, str):
                     item = inspect(r[-1]).mapper.attrs[item]
@@ -1696,7 +1695,8 @@ class MapperOptionsTest(_fixtures.FixtureTest):
         ctx = sess.query(User)._compile_context()
 
         def go():
-            result = list(sess.query(User).instances(r, ctx))
+            result = loading.instances(r, ctx).scalars().unique()
+            result = list(result)
             eq_(result, self.static.user_address_result)
 
         self.sql_count_(4, go)
@@ -1795,7 +1795,8 @@ class MapperOptionsTest(_fixtures.FixtureTest):
         ctx = sess.query(User)._compile_context()
 
         def go():
-            result = list(sess.query(User).instances(r, ctx))
+            result = loading.instances(r, ctx).scalars().unique()
+            result = list(result)
             eq_(result, self.static.user_all_result)
 
         self.assert_sql_count(testing.db, go, 6)

@@ -17,7 +17,7 @@ mapped in the same way as a :class:`_schema.Table`::
 
     from sqlalchemy import Table, Column, Integer, \
             String, MetaData, join, ForeignKey
-    from sqlalchemy.ext.declarative import declarative_base
+    from sqlalchemy.orm import DeclarativeBase
     from sqlalchemy.orm import column_property
 
     metadata_obj = MetaData()
@@ -39,7 +39,8 @@ mapped in the same way as a :class:`_schema.Table`::
     # columns.
     user_address_join = join(user_table, address_table)
 
-    Base = declarative_base()
+    class Base(DeclarativeBase):
+        metadata = metadata_obj
 
     # map to it
     class AddressUser(Base):
@@ -78,7 +79,7 @@ time while making use of the proper context, that is, accommodating for
 aliases and similar, the accessor :attr:`.ColumnProperty.Comparator.expressions`
 may be used::
 
-    q = session.query(AddressUser).group_by(*AddressUser.id.expressions)
+    stmt = select(AddressUser).group_by(*AddressUser.id.expressions)
 
 .. versionadded:: 1.3.17 Added the
    :attr:`.ColumnProperty.Comparator.expressions` accessor.

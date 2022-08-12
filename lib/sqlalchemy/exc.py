@@ -23,14 +23,11 @@ from typing import Tuple
 from typing import Type
 from typing import Union
 
-from .util import _preloaded
 from .util import compat
+from .util import preloaded as _preloaded
 
 if typing.TYPE_CHECKING:
     from .engine.interfaces import _AnyExecuteParams
-    from .engine.interfaces import _CoreAnyExecuteParams
-    from .engine.interfaces import _CoreMultiExecuteParams
-    from .engine.interfaces import _DBAPIAnyExecuteParams
     from .engine.interfaces import Dialect
     from .sql.compiler import Compiled
     from .sql.compiler import TypeCompiler
@@ -345,6 +342,8 @@ class MultipleResultsFound(InvalidRequestError):
 class NoReferenceError(InvalidRequestError):
     """Raised by ``ForeignKey`` to indicate a reference cannot be resolved."""
 
+    table_name: str
+
 
 class AwaitRequired(InvalidRequestError):
     """Error raised by the async greenlet spawn if no async operation
@@ -501,10 +500,7 @@ class StatementError(SQLAlchemyError):
 
     @_preloaded.preload_module("sqlalchemy.sql.util")
     def _sql_message(self) -> str:
-        if typing.TYPE_CHECKING:
-            from .sql import util
-        else:
-            util = _preloaded.preloaded.sql_util
+        util = _preloaded.sql_util
 
         details = [self._message()]
         if self.statement:
@@ -551,9 +547,20 @@ class DBAPIError(StatementError):
 
     code = "dbapi"
 
-    # I dont think I'm going to try to do overloads like this everywhere
-    # in the library, but as this module is early days for me typing everything
-    # I am sort of just practicing
+    @overload
+    @classmethod
+    def instance(
+        cls,
+        statement: Optional[str],
+        params: Optional[_AnyExecuteParams],
+        orig: Exception,
+        dbapi_base_err: Type[Exception],
+        hide_parameters: bool = False,
+        connection_invalidated: bool = False,
+        dialect: Optional["Dialect"] = None,
+        ismulti: Optional[bool] = None,
+    ) -> StatementError:
+        ...
 
     @overload
     @classmethod
@@ -568,21 +575,6 @@ class DBAPIError(StatementError):
         dialect: Optional["Dialect"] = None,
         ismulti: Optional[bool] = None,
     ) -> DontWrapMixin:
-        ...
-
-    @overload
-    @classmethod
-    def instance(
-        cls,
-        statement: Optional[str],
-        params: Optional[_AnyExecuteParams],
-        orig: Exception,
-        dbapi_base_err: Type[Exception],
-        hide_parameters: bool = False,
-        connection_invalidated: bool = False,
-        dialect: Optional["Dialect"] = None,
-        ismulti: Optional[bool] = None,
-    ) -> StatementError:
         ...
 
     @overload

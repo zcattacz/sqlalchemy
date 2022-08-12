@@ -13,10 +13,15 @@ Describing Databases with MetaData
 This section discusses the fundamental :class:`_schema.Table`, :class:`_schema.Column`
 and :class:`_schema.MetaData` objects.
 
+.. seealso::
+
+    :ref:`tutorial_working_with_metadata` - tutorial introduction to
+    SQLAlchemy's database metadata concept in the :ref:`unified_tutorial`
+
 A collection of metadata entities is stored in an object aptly named
 :class:`~sqlalchemy.schema.MetaData`::
 
-    from sqlalchemy import *
+    from sqlalchemy import MetaData
 
     metadata_obj = MetaData()
 
@@ -29,7 +34,11 @@ primary arguments are the table name, then the
 The remaining positional arguments are mostly
 :class:`~sqlalchemy.schema.Column` objects describing each column::
 
-    user = Table('user', metadata_obj,
+    from sqlalchemy import Table, Column, Integer, String
+
+    user = Table(
+        'user',
+        metadata_obj,
         Column('user_id', Integer, primary_key=True),
         Column('user_name', String(16), nullable=False),
         Column('email_address', String(60)),
@@ -93,6 +102,10 @@ table include::
     # via string
     employees.c['employee_id']
 
+    # a tuple of columns may be returned using multiple strings
+    # (new in 2.0)
+    emp_id, name, type = employees.c['employee_id', "name", "type"]
+
     # iterate through all columns
     for c in employees.c:
         print(c)
@@ -107,9 +120,6 @@ table include::
 
     # access the table's MetaData:
     employees.metadata
-
-    # access the table's bound Engine or Connection, if its MetaData is bound:
-    employees.bind
 
     # access a column's name, type, nullable, primary key, foreign key
     employees.c.employee_id.name
@@ -160,41 +170,41 @@ The usual way to issue CREATE is to use
 that first check for the existence of each individual table, and if not found
 will issue the CREATE statements:
 
-    .. sourcecode:: python+sql
+.. sourcecode:: python+sql
 
-        engine = create_engine('sqlite:///:memory:')
+    engine = create_engine('sqlite:///:memory:')
 
-        metadata_obj = MetaData()
+    metadata_obj = MetaData()
 
-        user = Table('user', metadata_obj,
-            Column('user_id', Integer, primary_key=True),
-            Column('user_name', String(16), nullable=False),
-            Column('email_address', String(60), key='email'),
-            Column('nickname', String(50), nullable=False)
-        )
+    user = Table('user', metadata_obj,
+        Column('user_id', Integer, primary_key=True),
+        Column('user_name', String(16), nullable=False),
+        Column('email_address', String(60), key='email'),
+        Column('nickname', String(50), nullable=False)
+    )
 
-        user_prefs = Table('user_prefs', metadata_obj,
-            Column('pref_id', Integer, primary_key=True),
-            Column('user_id', Integer, ForeignKey("user.user_id"), nullable=False),
-            Column('pref_name', String(40), nullable=False),
-            Column('pref_value', String(100))
-        )
+    user_prefs = Table('user_prefs', metadata_obj,
+        Column('pref_id', Integer, primary_key=True),
+        Column('user_id', Integer, ForeignKey("user.user_id"), nullable=False),
+        Column('pref_name', String(40), nullable=False),
+        Column('pref_value', String(100))
+    )
 
-        {sql}metadata_obj.create_all(engine)
-        PRAGMA table_info(user){}
-        CREATE TABLE user(
-                user_id INTEGER NOT NULL PRIMARY KEY,
-                user_name VARCHAR(16) NOT NULL,
-                email_address VARCHAR(60),
-                nickname VARCHAR(50) NOT NULL
-        )
-        PRAGMA table_info(user_prefs){}
-        CREATE TABLE user_prefs(
-                pref_id INTEGER NOT NULL PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES user(user_id),
-                pref_name VARCHAR(40) NOT NULL,
-                pref_value VARCHAR(100)
-        )
+    {sql}metadata_obj.create_all(engine)
+    PRAGMA table_info(user){}
+    CREATE TABLE user(
+            user_id INTEGER NOT NULL PRIMARY KEY,
+            user_name VARCHAR(16) NOT NULL,
+            email_address VARCHAR(60),
+            nickname VARCHAR(50) NOT NULL
+    )
+    PRAGMA table_info(user_prefs){}
+    CREATE TABLE user_prefs(
+            pref_id INTEGER NOT NULL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES user(user_id),
+            pref_name VARCHAR(40) NOT NULL,
+            pref_value VARCHAR(100)
+    )
 
 :func:`~sqlalchemy.schema.MetaData.create_all` creates foreign key constraints
 between tables usually inline with the table definition itself, and for this
@@ -384,7 +394,7 @@ at once, such as::
     :ref:`multipart_schema_names` - describes use of dotted schema names
     with the SQL Server dialect.
 
-    :ref:`schema_table_reflection`
+    :ref:`metadata_reflection_schemas`
 
 
 .. _schema_metadata_schema_name:
@@ -531,7 +541,7 @@ Schemas and Reflection
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The schema feature of SQLAlchemy interacts with the table reflection
-feature introduced at ref:`metadata_reflection_toplevel`.  See the section
+feature introduced at :ref:`metadata_reflection_toplevel`.  See the section
 :ref:`metadata_reflection_schemas` for additional details on how this works.
 
 
@@ -557,20 +567,14 @@ Column, Table, MetaData API
 ---------------------------
 
 .. attribute:: sqlalchemy.schema.BLANK_SCHEMA
+    :noindex:
 
-    Symbol indicating that a :class:`_schema.Table` or :class:`.Sequence`
-    should have 'None' for its schema, even if the parent
-    :class:`_schema.MetaData` has specified a schema.
+    Refers to :attr:`.SchemaConst.BLANK_SCHEMA`.
 
-    .. seealso::
+.. attribute:: sqlalchemy.schema.RETAIN_SCHEMA
+    :noindex:
 
-        :paramref:`_schema.MetaData.schema`
-
-        :paramref:`_schema.Table.schema`
-
-        :paramref:`.Sequence.schema`
-
-    .. versionadded:: 1.0.14
+    Refers to :attr:`.SchemaConst.RETAIN_SCHEMA`
 
 
 .. autoclass:: Column
@@ -581,6 +585,8 @@ Column, Table, MetaData API
 .. autoclass:: MetaData
     :members:
 
+.. autoclass:: SchemaConst
+    :members:
 
 .. autoclass:: SchemaItem
     :members:

@@ -6,9 +6,12 @@ import sys
 
 from sqlalchemy.testing import config
 from sqlalchemy.testing import fixtures
+from sqlalchemy.testing import requires
 
 
 class DocTest(fixtures.TestBase):
+    __requires__ = ("python39",)
+
     def _setup_logger(self):
         rootlogger = logging.getLogger("sqlalchemy.engine.Engine")
 
@@ -83,6 +86,7 @@ class DocTest(fixtures.TestBase):
                 globs.update(test.globs)
                 assert not runner.failures
 
+    @requires.has_json_each
     def test_20_style(self):
         self._run_doctest(
             "tutorial/index.rst",

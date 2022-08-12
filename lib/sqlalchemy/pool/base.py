@@ -40,10 +40,10 @@ if TYPE_CHECKING:
     from ..engine.interfaces import DBAPIConnection
     from ..engine.interfaces import DBAPICursor
     from ..engine.interfaces import Dialect
-    from ..event import _Dispatch
     from ..event import _DispatchCommon
     from ..event import _ListenerFnType
     from ..event import dispatcher
+    from ..sql._typing import _InfoType
 
 
 class ResetStyle(Enum):
@@ -82,7 +82,7 @@ class _ConnDialect:
     def do_close(self, dbapi_connection: DBAPIConnection) -> None:
         dbapi_connection.close()
 
-    def do_ping(self, dbapi_connection: DBAPIConnection) -> None:
+    def do_ping(self, dbapi_connection: DBAPIConnection) -> bool:
         raise NotImplementedError(
             "The ping feature requires that a dialect is "
             "passed to the connection pool."
@@ -269,7 +269,7 @@ class Pool(log.Identified, event.EventTarget):
 
         # mypy seems to get super confused assigning functions to
         # attributes
-        self._invoke_creator = self._should_wrap_creator(creator)  # type: ignore  # noqa E501
+        self._invoke_creator = self._should_wrap_creator(creator)  # type: ignore  # noqa: E501
 
     @_creator.deleter
     def _creator(self) -> None:
@@ -461,51 +461,55 @@ class ManagesConnection:
 
     """
 
-    info: Dict[str, Any]
-    """Info dictionary associated with the underlying DBAPI connection
-    referred to by this :class:`.ManagesConnection` instance, allowing
-    user-defined data to be associated with the connection.
+    @util.ro_memoized_property
+    def info(self) -> _InfoType:
+        """Info dictionary associated with the underlying DBAPI connection
+        referred to by this :class:`.ManagesConnection` instance, allowing
+        user-defined data to be associated with the connection.
 
-    The data in this dictionary is persistent for the lifespan
-    of the DBAPI connection itself, including across pool checkins
-    and checkouts.  When the connection is invalidated
-    and replaced with a new one, this dictionary is cleared.
+        The data in this dictionary is persistent for the lifespan
+        of the DBAPI connection itself, including across pool checkins
+        and checkouts.  When the connection is invalidated
+        and replaced with a new one, this dictionary is cleared.
 
-    For a :class:`.PoolProxiedConnection` instance that's not associated
-    with a :class:`.ConnectionPoolEntry`, such as if it were detached, the
-    attribute returns a dictionary that is local to that
-    :class:`.ConnectionPoolEntry`. Therefore the
-    :attr:`.ManagesConnection.info` attribute will always provide a Python
-    dictionary.
+        For a :class:`.PoolProxiedConnection` instance that's not associated
+        with a :class:`.ConnectionPoolEntry`, such as if it were detached, the
+        attribute returns a dictionary that is local to that
+        :class:`.ConnectionPoolEntry`. Therefore the
+        :attr:`.ManagesConnection.info` attribute will always provide a Python
+        dictionary.
 
-    .. seealso::
+        .. seealso::
 
-        :attr:`.ManagesConnection.record_info`
-
-
-    """
-
-    record_info: Optional[Dict[str, Any]]
-    """Persistent info dictionary associated with this
-    :class:`.ManagesConnection`.
-
-    Unlike the :attr:`.ManagesConnection.info` dictionary, the lifespan
-    of this dictionary is that of the :class:`.ConnectionPoolEntry`
-    which owns it; therefore this dictionary will persist across
-    reconnects and connection invalidation for a particular entry
-    in the connection pool.
-
-    For a :class:`.PoolProxiedConnection` instance that's not associated
-    with a :class:`.ConnectionPoolEntry`, such as if it were detached, the
-    attribute returns None. Contrast to the :attr:`.ManagesConnection.info`
-    dictionary which is never None.
+            :attr:`.ManagesConnection.record_info`
 
 
-    .. seealso::
+        """
+        raise NotImplementedError()
 
-        :attr:`.ManagesConnection.info`
+    @util.ro_memoized_property
+    def record_info(self) -> Optional[_InfoType]:
+        """Persistent info dictionary associated with this
+        :class:`.ManagesConnection`.
 
-    """
+        Unlike the :attr:`.ManagesConnection.info` dictionary, the lifespan
+        of this dictionary is that of the :class:`.ConnectionPoolEntry`
+        which owns it; therefore this dictionary will persist across
+        reconnects and connection invalidation for a particular entry
+        in the connection pool.
+
+        For a :class:`.PoolProxiedConnection` instance that's not associated
+        with a :class:`.ConnectionPoolEntry`, such as if it were detached, the
+        attribute returns None. Contrast to the :attr:`.ManagesConnection.info`
+        dictionary which is never None.
+
+
+        .. seealso::
+
+            :attr:`.ManagesConnection.info`
+
+        """
+        raise NotImplementedError()
 
     def invalidate(
         self, e: Optional[BaseException] = None, soft: bool = False
@@ -609,7 +613,7 @@ class _ConnectionRecord(ConnectionPoolEntry):
     dbapi_connection: Optional[DBAPIConnection]
 
     @property
-    def driver_connection(self) -> Optional[Any]:  # type: ignore[override]  # mypy#4125  # noqa E501
+    def driver_connection(self) -> Optional[Any]:  # type: ignore[override]  # mypy#4125  # noqa: E501
         if self.dbapi_connection is None:
             return None
         else:
@@ -617,22 +621,22 @@ class _ConnectionRecord(ConnectionPoolEntry):
                 self.dbapi_connection
             )
 
-    @property
+    @util.deprecated_property(
+        "2.0",
+        "The _ConnectionRecord.connection attribute is deprecated; "
+        "please use 'driver_connection'",
+    )
     def connection(self) -> Optional[DBAPIConnection]:
         return self.dbapi_connection
 
-    @connection.setter
-    def connection(self, value: DBAPIConnection) -> None:
-        self.dbapi_connection = value
-
     _soft_invalidate_time: float = 0
 
-    @util.memoized_property
-    def info(self) -> Dict[str, Any]:  # type: ignore[override]  # mypy#4125
+    @util.ro_memoized_property
+    def info(self) -> _InfoType:
         return {}
 
-    @util.memoized_property
-    def record_info(self) -> Optional[Dict[str, Any]]:  # type: ignore[override]  # mypy#4125  # noqa E501
+    @util.ro_memoized_property
+    def record_info(self) -> Optional[_InfoType]:
         return {}
 
     @classmethod
@@ -1080,8 +1084,8 @@ class _AdhocProxiedConnection(PoolProxiedConnection):
     ) -> None:
         self._is_valid = False
 
-    @property
-    def record_info(self) -> Optional[Dict[str, Any]]:  # type: ignore[override]  # mypy#4125  # noqa E501
+    @util.ro_non_memoized_property
+    def record_info(self) -> Optional[_InfoType]:
         return self._connection_record.record_info
 
     def cursor(self, *args: Any, **kwargs: Any) -> DBAPICursor:
@@ -1147,18 +1151,18 @@ class _ConnectionFairy(PoolProxiedConnection):
     _connection_record: Optional[_ConnectionRecord]
 
     @property
-    def driver_connection(self) -> Optional[Any]:  # type: ignore[override]  # mypy#4125  # noqa E501
+    def driver_connection(self) -> Optional[Any]:  # type: ignore[override]  # mypy#4125  # noqa: E501
         if self._connection_record is None:
             return None
         return self._connection_record.driver_connection
 
-    @property
+    @util.deprecated_property(
+        "2.0",
+        "The _ConnectionFairy.connection attribute is deprecated; "
+        "please use 'driver_connection'",
+    )
     def connection(self) -> DBAPIConnection:
         return self.dbapi_connection
-
-    @connection.setter
-    def connection(self, value: DBAPIConnection) -> None:
-        self.dbapi_connection = value
 
     @classmethod
     def _checkout(
@@ -1314,15 +1318,15 @@ class _ConnectionFairy(PoolProxiedConnection):
     def is_detached(self) -> bool:
         return self._connection_record is None
 
-    @util.memoized_property
-    def info(self) -> Dict[str, Any]:  # type: ignore[override]  # mypy#4125
+    @util.ro_memoized_property
+    def info(self) -> _InfoType:
         if self._connection_record is None:
             return {}
         else:
             return self._connection_record.info
 
-    @property
-    def record_info(self) -> Optional[Dict[str, Any]]:  # type: ignore[override]  # mypy#4125  # noqa E501
+    @util.ro_non_memoized_property
+    def record_info(self) -> Optional[_InfoType]:
         if self._connection_record is None:
             return None
         else:

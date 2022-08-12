@@ -4,6 +4,8 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: ignore-errors
+
 """
 .. dialect:: mssql
     :name: Microsoft SQL Server
@@ -433,7 +435,10 @@ Valid values for ``isolation_level`` include:
 * ``SERIALIZABLE``
 * ``SNAPSHOT`` - specific to SQL Server
 
-.. versionadded:: 1.2 added AUTOCOMMIT isolation level setting
+There are also more options for isolation level configurations, such as
+"sub-engine" objects linked to a main :class:`_engine.Engine` which each apply
+different isolation level settings.  See the discussion at
+:ref:`dbapi_autocommit` for background.
 
 .. seealso::
 
@@ -805,10 +810,15 @@ https://msdn.microsoft.com/en-us/library/ms175095.aspx.
 
 """  # noqa
 
+from __future__ import annotations
+
 import codecs
 import datetime
 import operator
 import re
+from typing import overload
+from typing import TYPE_CHECKING
+from uuid import UUID as _python_UUID
 
 from . import information_schema as ischema
 from .json import JSON
@@ -820,11 +830,11 @@ from ... import schema as sa_schema
 from ... import Sequence
 from ... import sql
 from ... import text
-from ... import types as sqltypes
 from ... import util
 from ...engine import cursor as _cursor
 from ...engine import default
 from ...engine import reflection
+from ...engine.reflection import ReflectionDefaults
 from ...sql import coercions
 from ...sql import compiler
 from ...sql import elements
@@ -832,7 +842,9 @@ from ...sql import expression
 from ...sql import func
 from ...sql import quoted_name
 from ...sql import roles
+from ...sql import sqltypes
 from ...sql import util as sql_util
+from ...sql._typing import is_sql_compiler
 from ...types import BIGINT
 from ...types import BINARY
 from ...types import CHAR
@@ -848,7 +860,11 @@ from ...types import SMALLINT
 from ...types import TEXT
 from ...types import VARCHAR
 from ...util import update_wrapper
+from ...util.typing import Literal
 
+if TYPE_CHECKING:
+    from ...sql.dml import DMLState
+    from ...sql.selectable import TableClause
 
 # https://sqlserverbuilds.blogspot.com/
 MS_2017_VERSION = (14,)
@@ -1360,8 +1376,88 @@ class SMALLMONEY(sqltypes.TypeEngine):
     __visit_name__ = "SMALLMONEY"
 
 
-class UNIQUEIDENTIFIER(sqltypes.TypeEngine):
+class MSUUid(sqltypes.Uuid):
+    def bind_processor(self, dialect):
+        if self.native_uuid:
+            # this is currently assuming pyodbc; might not work for
+            # some other mssql driver
+            return None
+        else:
+            if self.as_uuid:
+
+                def process(value):
+                    if value is not None:
+                        value = value.hex
+                    return value
+
+                return process
+            else:
+
+                def process(value):
+                    if value is not None:
+                        value = value.replace("-", "").replace("''", "'")
+                    return value
+
+                return process
+
+    def literal_processor(self, dialect):
+        if self.native_uuid:
+
+            def process(value):
+                if value is not None:
+                    value = f"""'{str(value).replace("''", "'")}'"""
+                return value
+
+            return process
+        else:
+            if self.as_uuid:
+
+                def process(value):
+                    if value is not None:
+                        value = f"""'{value.hex}'"""
+                    return value
+
+                return process
+            else:
+
+                def process(value):
+                    if value is not None:
+                        value = f"""'{
+                            value.replace("-", "").replace("'", "''")
+                        }'"""
+                    return value
+
+                return process
+
+
+class UNIQUEIDENTIFIER(sqltypes.Uuid[sqltypes._UUID_RETURN]):
     __visit_name__ = "UNIQUEIDENTIFIER"
+
+    @overload
+    def __init__(
+        self: "UNIQUEIDENTIFIER[_python_UUID]", as_uuid: Literal[True] = ...
+    ):
+        ...
+
+    @overload
+    def __init__(self: "UNIQUEIDENTIFIER[str]", as_uuid: Literal[False] = ...):
+        ...
+
+    def __init__(self, as_uuid: bool = True):
+        """Construct a :class:`_mssql.UNIQUEIDENTIFIER` type.
+
+
+        :param as_uuid=True: if True, values will be interpreted
+         as Python uuid objects, converting to/from string via the
+         DBAPI.
+
+         .. versionchanged: 2.0 Added direct "uuid" support to the
+            :class:`_mssql.UNIQUEIDENTIFIER` datatype; uuid interpretation
+            defaults to ``True``.
+
+        """
+        self.as_uuid = as_uuid
+        self.native_uuid = True
 
 
 class SQL_VARIANT(sqltypes.TypeEngine):
@@ -1610,6 +1706,12 @@ class MSTypeCompiler(compiler.GenericTypeCompiler):
     def visit_SMALLMONEY(self, type_, **kw):
         return "SMALLMONEY"
 
+    def visit_uuid(self, type_, **kw):
+        if type_.native_uuid:
+            return self.visit_UNIQUEIDENTIFIER(type_, **kw)
+        else:
+            return super().visit_uuid(type_, **kw)
+
     def visit_UNIQUEIDENTIFIER(self, type_, **kw):
         return "UNIQUEIDENTIFIER"
 
@@ -1622,6 +1724,8 @@ class MSExecutionContext(default.DefaultExecutionContext):
     _select_lastrowid = False
     _lastrowid = None
     _rowcount = None
+
+    dialect: MSDialect
 
     def _opt_encode(self, statement):
 
@@ -1636,31 +1740,36 @@ class MSExecutionContext(default.DefaultExecutionContext):
         """Activate IDENTITY_INSERT if needed."""
 
         if self.isinsert:
+            if TYPE_CHECKING:
+                assert is_sql_compiler(self.compiled)
+                assert isinstance(self.compiled.compile_state, DMLState)
+                assert isinstance(
+                    self.compiled.compile_state.dml_table, TableClause
+                )
+
             tbl = self.compiled.compile_state.dml_table
             id_column = tbl._autoincrement_column
-            insert_has_identity = (id_column is not None) and (
-                not isinstance(id_column.default, Sequence)
-            )
 
-            if insert_has_identity:
-                compile_state = self.compiled.compile_state
+            if id_column is not None and (
+                not isinstance(id_column.default, Sequence)
+            ):
+                insert_has_identity = True
+                compile_state = self.compiled.dml_compile_state
                 self._enable_identity_insert = (
                     id_column.key in self.compiled_parameters[0]
                 ) or (
                     compile_state._dict_parameters
-                    and (
-                        id_column.key in compile_state._dict_parameters
-                        or id_column in compile_state._dict_parameters
-                    )
+                    and (id_column.key in compile_state._insert_col_keys)
                 )
 
             else:
+                insert_has_identity = False
                 self._enable_identity_insert = False
 
             self._select_lastrowid = (
                 not self.compiled.inline
                 and insert_has_identity
-                and not self.compiled.returning
+                and not self.compiled.effective_returning
                 and not self._enable_identity_insert
                 and not self.executemany
             )
@@ -1701,8 +1810,10 @@ class MSExecutionContext(default.DefaultExecutionContext):
             self._lastrowid = int(row[0])
 
         elif (
-            self.isinsert or self.isupdate or self.isdelete
-        ) and self.compiled.returning:
+            self.compiled is not None
+            and is_sql_compiler(self.compiled)
+            and self.compiled.effective_returning
+        ):
             self.cursor_fetch_strategy = (
                 _cursor.FullyBufferedCursorFetchStrategy(
                     self.cursor,
@@ -1712,6 +1823,12 @@ class MSExecutionContext(default.DefaultExecutionContext):
             )
 
         if self._enable_identity_insert:
+            if TYPE_CHECKING:
+                assert is_sql_compiler(self.compiled)
+                assert isinstance(self.compiled.compile_state, DMLState)
+                assert isinstance(
+                    self.compiled.compile_state.dml_table, TableClause
+                )
             conn._cursor_execute(
                 self.cursor,
                 self._opt_encode(
@@ -1807,6 +1924,11 @@ class MSSQLCompiler(compiler.SQLCompiler):
     def visit_char_length_func(self, fn, **kw):
         return "LEN%s" % self.function_argspec(fn, **kw)
 
+    def visit_concat_op_expression_clauselist(
+        self, clauselist, operator, **kw
+    ):
+        return " + ".join(self.process(elem, **kw) for elem in clauselist)
+
     def visit_concat_op_binary(self, binary, operator, **kw):
         return "%s + %s" % (
             self.process(binary.left, **kw),
@@ -1872,9 +1994,6 @@ class MSSQLCompiler(compiler.SQLCompiler):
             )
         )
 
-    def fetch_clause(self, cs, **kwargs):
-        return ""
-
     def limit_clause(self, cs, **kwargs):
         return ""
 
@@ -1906,21 +2025,13 @@ class MSSQLCompiler(compiler.SQLCompiler):
         if self.dialect._supports_offset_fetch and not self._use_top(select):
             self._check_can_use_fetch_limit(select)
 
-            text = ""
+            return self.fetch_clause(
+                select,
+                fetch_clause=self._get_limit_or_fetch(select),
+                require_offset=True,
+                **kw,
+            )
 
-            if select._offset_clause is not None:
-                offset_str = self.process(select._offset_clause, **kw)
-            else:
-                offset_str = "0"
-            text += "\n OFFSET %s ROWS" % offset_str
-
-            limit = self._get_limit_or_fetch(select)
-
-            if limit is not None:
-                text += "\n FETCH FIRST %s ROWS ONLY" % self.process(
-                    limit, **kw
-                )
-            return text
         else:
             return ""
 
@@ -2065,17 +2176,21 @@ class MSSQLCompiler(compiler.SQLCompiler):
             )
         return super(MSSQLCompiler, self).visit_binary(binary, **kwargs)
 
-    def returning_clause(self, stmt, returning_cols):
+    def returning_clause(
+        self, stmt, returning_cols, *, populate_result_map, **kw
+    ):
         # SQL server returning clause requires that the columns refer to
         # the virtual table names "inserted" or "deleted".   Here, we make
         # a simple alias of our table with that name, and then adapt the
         # columns we have from the list of RETURNING columns to that new name
         # so that they render as "inserted.<colname>" / "deleted.<colname>".
 
-        if self.isinsert or self.isupdate:
+        if stmt.is_insert or stmt.is_update:
             target = stmt.table.alias("inserted")
-        else:
+        elif stmt.is_delete:
             target = stmt.table.alias("deleted")
+        else:
+            assert False, "expected Insert, Update or Delete statement"
 
         adapter = sql_util.ClauseAdapter(target)
 
@@ -2091,6 +2206,7 @@ class MSSQLCompiler(compiler.SQLCompiler):
             self._label_returning_column(
                 stmt,
                 adapter.traverse(c),
+                populate_result_map,
                 {"result_map_targets": (c,)},
             )
             for c in expression._select_iterables(returning_cols)
@@ -2311,7 +2427,7 @@ class MSDDLCompiler(compiler.DDLCompiler):
         if column.computed is not None:
             colspec += " " + self.process(column.computed)
         else:
-            colspec += " " + self.dialect.type_compiler.process(
+            colspec += " " + self.dialect.type_compiler_instance.process(
                 column.type, type_expression=column
             )
 
@@ -2672,13 +2788,20 @@ class MSDialect(default.DefaultDialect):
     supports_statement_cache = True
     supports_default_values = True
     supports_empty_insert = False
+
+    # supports_native_uuid is partial here, so we implement our
+    # own impl type
+
     execution_ctx_cls = MSExecutionContext
     use_scope_identity = True
     max_identifier_length = 128
     schema_name = "dbo"
 
-    implicit_returning = True
-    full_returning = True
+    insert_returning = True
+    update_returning = True
+    delete_returning = True
+    update_returning_multifrom = True
+    delete_returning_multifrom = True
 
     colspecs = {
         sqltypes.DateTime: _MSDateTime,
@@ -2693,6 +2816,7 @@ class MSDialect(default.DefaultDialect):
         DATETIME2: DATETIME2,
         SMALLDATETIME: SMALLDATETIME,
         DATETIME: DATETIME,
+        sqltypes.Uuid: MSUUid,
     }
 
     engine_config_types = default.DefaultDialect.engine_config_types.union(
@@ -2719,7 +2843,7 @@ class MSDialect(default.DefaultDialect):
 
     statement_compiler = MSSQLCompiler
     ddl_compiler = MSDDLCompiler
-    type_compiler = MSTypeCompiler
+    type_compiler_cls = MSTypeCompiler
     preparer = MSIdentifierPreparer
 
     construct_arguments = [
@@ -2741,6 +2865,7 @@ class MSDialect(default.DefaultDialect):
         json_serializer=None,
         json_deserializer=None,
         legacy_schema_aliasing=None,
+        ignore_no_transaction_on_rollback=False,
         **opts,
     ):
         self.query_timeout = int(query_timeout or 0)
@@ -2748,6 +2873,9 @@ class MSDialect(default.DefaultDialect):
 
         self.use_scope_identity = use_scope_identity
         self.deprecate_large_types = deprecate_large_types
+        self.ignore_no_transaction_on_rollback = (
+            ignore_no_transaction_on_rollback
+        )
 
         if legacy_schema_aliasing is not None:
             util.warn_deprecated(
@@ -2771,6 +2899,22 @@ class MSDialect(default.DefaultDialect):
         # SQL Server does not support RELEASE SAVEPOINT
         pass
 
+    def do_rollback(self, dbapi_connection):
+        try:
+            super(MSDialect, self).do_rollback(dbapi_connection)
+        except self.dbapi.ProgrammingError as e:
+            if self.ignore_no_transaction_on_rollback and re.match(
+                r".*\b111214\b", str(e)
+            ):
+                util.warn(
+                    "ProgrammingError 111214 "
+                    "'No corresponding transaction found.' "
+                    "has been suppressed via "
+                    "ignore_no_transaction_on_rollback=True"
+                )
+            else:
+                raise
+
     _isolation_lookup = set(
         [
             "SERIALIZABLE",
@@ -2792,46 +2936,41 @@ class MSDialect(default.DefaultDialect):
             dbapi_connection.commit()
 
     def get_isolation_level(self, dbapi_connection):
-        last_error = None
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute(
+                "SELECT name FROM sys.system_views WHERE name IN "
+                "('dm_exec_sessions', 'dm_pdw_nodes_exec_sessions')"
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise NotImplementedError(
+                    "Can't fetch isolation level on this particular "
+                    "SQL Server version."
+                )
 
-        views = ("sys.dm_exec_sessions", "sys.dm_pdw_nodes_exec_sessions")
-        for view in views:
-            cursor = dbapi_connection.cursor()
-            try:
-                cursor.execute(
-                    f"""
-                  SELECT CASE transaction_isolation_level
+            view_name = "sys.{}".format(row[0])
+            cursor.execute(
+                """
+                    SELECT CASE transaction_isolation_level
                     WHEN 0 THEN NULL
                     WHEN 1 THEN 'READ UNCOMMITTED'
                     WHEN 2 THEN 'READ COMMITTED'
                     WHEN 3 THEN 'REPEATABLE READ'
                     WHEN 4 THEN 'SERIALIZABLE'
                     WHEN 5 THEN 'SNAPSHOT' END AS TRANSACTION_ISOLATION_LEVEL
-                    FROM {view}
+                    FROM {}
                     where session_id = @@SPID
-                  """
+                """.format(
+                    view_name
                 )
-                val = cursor.fetchone()[0]
-            except self.dbapi.Error as err:
-                # Python3 scoping rules
-                last_error = err
-                continue
-            else:
-                return val.upper()
-            finally:
-                cursor.close()
-        else:
-            # note that the NotImplementedError is caught by
-            # DefaultDialect, so the warning here is all that displays
-            util.warn(
-                "Could not fetch transaction isolation level, "
-                f"tried views: {views}; final error was: {last_error}"
             )
-            raise NotImplementedError(
-                "Can't fetch isolation level on this particular "
-                f"SQL Server version. tried views: {views}; final "
-                f"error was: {last_error}"
-            )
+            row = cursor.fetchone()
+            assert row is not None
+            val = row[0]
+        finally:
+            cursor.close()
+        return val.upper()
 
     def initialize(self, connection):
         super(MSDialect, self).initialize(connection)
@@ -2878,55 +3017,16 @@ class MSDialect(default.DefaultDialect):
             return self.schema_name
 
     @_db_plus_owner
-    def has_table(self, connection, tablename, dbname, owner, schema):
+    def has_table(self, connection, tablename, dbname, owner, schema, **kw):
         self._ensure_has_table_connection(connection)
-        if tablename.startswith("#"):  # temporary table
-            # mssql does not support temporary views
-            # SQL Error [4103] [S0001]: "#v": Temporary views are not allowed
-            tables = ischema.mssql_temp_table_columns
 
-            s = sql.select(tables.c.table_name).where(
-                tables.c.table_name.like(
-                    self._temp_table_name_like_pattern(tablename)
-                )
-            )
+        return self._internal_has_table(connection, tablename, owner, **kw)
 
-            # #7168: fetch all (not just first match) in case some other #temp
-            #        table with the same name happens to appear first
-            table_names = connection.execute(s).scalars().fetchall()
-            # #6910: verify it's not a temp table from another session
-            for table_name in table_names:
-                if bool(
-                    connection.scalar(
-                        text("SELECT object_id(:table_name)"),
-                        {"table_name": "tempdb.dbo.[{}]".format(table_name)},
-                    )
-                ):
-                    return True
-            else:
-                return False
-        else:
-            tables = ischema.tables
-
-            s = sql.select(tables.c.table_name).where(
-                sql.and_(
-                    sql.or_(
-                        tables.c.table_type == "BASE TABLE",
-                        tables.c.table_type == "VIEW",
-                    ),
-                    tables.c.table_name == tablename,
-                )
-            )
-
-            if owner:
-                s = s.where(tables.c.table_schema == owner)
-
-            c = connection.execute(s)
-
-            return c.first() is not None
-
+    @reflection.cache
     @_db_plus_owner
-    def has_sequence(self, connection, sequencename, dbname, owner, schema):
+    def has_sequence(
+        self, connection, sequencename, dbname, owner, schema, **kw
+    ):
         sequences = ischema.sequences
 
         s = sql.select(sequences.c.sequence_name).where(
@@ -2996,6 +3096,60 @@ class MSDialect(default.DefaultDialect):
         return view_names
 
     @reflection.cache
+    def _internal_has_table(self, connection, tablename, owner, **kw):
+        if tablename.startswith("#"):  # temporary table
+            # mssql does not support temporary views
+            # SQL Error [4103] [S0001]: "#v": Temporary views are not allowed
+            tables = ischema.mssql_temp_table_columns
+
+            s = sql.select(tables.c.table_name).where(
+                tables.c.table_name.like(
+                    self._temp_table_name_like_pattern(tablename)
+                )
+            )
+
+            # #7168: fetch all (not just first match) in case some other #temp
+            #        table with the same name happens to appear first
+            table_names = connection.scalars(s).all()
+            # #6910: verify it's not a temp table from another session
+            for table_name in table_names:
+                if bool(
+                    connection.scalar(
+                        text("SELECT object_id(:table_name)"),
+                        {"table_name": "tempdb.dbo.[{}]".format(table_name)},
+                    )
+                ):
+                    return True
+            else:
+                return False
+        else:
+            tables = ischema.tables
+
+            s = sql.select(tables.c.table_name).where(
+                sql.and_(
+                    sql.or_(
+                        tables.c.table_type == "BASE TABLE",
+                        tables.c.table_type == "VIEW",
+                    ),
+                    tables.c.table_name == tablename,
+                )
+            )
+
+            if owner:
+                s = s.where(tables.c.table_schema == owner)
+
+            c = connection.execute(s)
+
+            return c.first() is not None
+
+    def _default_or_error(self, connection, tablename, owner, method, **kw):
+        # TODO: try to avoid having to run a separate query here
+        if self._internal_has_table(connection, tablename, owner, **kw):
+            return method()
+        else:
+            raise exc.NoSuchTableError(f"{owner}.{tablename}")
+
+    @reflection.cache
     @_db_plus_owner
     def get_indexes(self, connection, tablename, dbname, owner, schema, **kw):
         filter_definition = (
@@ -3006,14 +3160,14 @@ class MSDialect(default.DefaultDialect):
         rp = connection.execution_options(future_result=True).execute(
             sql.text(
                 "select ind.index_id, ind.is_unique, ind.name, "
-                "%s "
+                f"{filter_definition} "
                 "from sys.indexes as ind join sys.tables as tab on "
                 "ind.object_id=tab.object_id "
                 "join sys.schemas as sch on sch.schema_id=tab.schema_id "
                 "where tab.name = :tabname "
                 "and sch.name=:schname "
-                "and ind.is_primary_key=0 and ind.type != 0"
-                % filter_definition
+                "and ind.is_primary_key=0 and ind.type != 0 "
+                "order by ind.name "
             )
             .bindparams(
                 sql.bindparam("tabname", tablename, ischema.CoerceUnicode()),
@@ -3071,31 +3225,34 @@ class MSDialect(default.DefaultDialect):
                 "mssql_include"
             ] = index_info["include_columns"]
 
-        return list(indexes.values())
+        if indexes:
+            return list(indexes.values())
+        else:
+            return self._default_or_error(
+                connection, tablename, owner, ReflectionDefaults.indexes, **kw
+            )
 
     @reflection.cache
     @_db_plus_owner
     def get_view_definition(
         self, connection, viewname, dbname, owner, schema, **kw
     ):
-        rp = connection.execute(
+        view_def = connection.execute(
             sql.text(
-                "select definition from sys.sql_modules as mod, "
-                "sys.views as views, "
-                "sys.schemas as sch"
-                " where "
-                "mod.object_id=views.object_id and "
-                "views.schema_id=sch.schema_id and "
-                "views.name=:viewname and sch.name=:schname"
+                "select mod.definition "
+                "from sys.sql_modules as mod "
+                "join sys.views as views on mod.object_id = views.object_id "
+                "join sys.schemas as sch on views.schema_id = sch.schema_id "
+                "where views.name=:viewname and sch.name=:schname"
             ).bindparams(
                 sql.bindparam("viewname", viewname, ischema.CoerceUnicode()),
                 sql.bindparam("schname", owner, ischema.CoerceUnicode()),
             )
-        )
-
-        if rp:
-            view_def = rp.scalar()
+        ).scalar()
+        if view_def:
             return view_def
+        else:
+            raise exc.NoSuchTableError(f"{owner}.{viewname}")
 
     def _temp_table_name_like_pattern(self, tablename):
         # LIKE uses '%' to match zero or more characters and '_' to match any
@@ -3161,14 +3318,16 @@ class MSDialect(default.DefaultDialect):
             computed_cols,
             onclause=sql.and_(
                 computed_cols.c.object_id == func.object_id(full_name),
-                computed_cols.c.name == columns.c.column_name,
+                computed_cols.c.name
+                == columns.c.column_name.collate("DATABASE_DEFAULT"),
             ),
             isouter=True,
         ).join(
             identity_cols,
             onclause=sql.and_(
                 identity_cols.c.object_id == func.object_id(full_name),
-                identity_cols.c.name == columns.c.column_name,
+                identity_cols.c.name
+                == columns.c.column_name.collate("DATABASE_DEFAULT"),
             ),
             isouter=True,
         )
@@ -3283,7 +3442,12 @@ class MSDialect(default.DefaultDialect):
 
             cols.append(cdict)
 
-        return cols
+        if cols:
+            return cols
+        else:
+            return self._default_or_error(
+                connection, tablename, owner, ReflectionDefaults.columns, **kw
+            )
 
     @reflection.cache
     @_db_plus_owner
@@ -3316,7 +3480,16 @@ class MSDialect(default.DefaultDialect):
                 pkeys.append(row["COLUMN_NAME"])
                 if constraint_name is None:
                     constraint_name = row[C.c.constraint_name.name]
-        return {"constrained_columns": pkeys, "name": constraint_name}
+        if pkeys:
+            return {"constrained_columns": pkeys, "name": constraint_name}
+        else:
+            return self._default_or_error(
+                connection,
+                tablename,
+                owner,
+                ReflectionDefaults.pk_constraint,
+                **kw,
+            )
 
     @reflection.cache
     @_db_plus_owner
@@ -3422,7 +3595,8 @@ index_info AS (
             AND index_info.index_name = fk_info.unique_constraint_name
             AND index_info.ordinal_position = fk_info.ordinal_position
 
-    ORDER BY constraint_schema, constraint_name, ordinal_position
+    ORDER BY fk_info.constraint_schema, fk_info.constraint_name,
+        fk_info.ordinal_position
 """
             )
             .bindparams(
@@ -3456,7 +3630,7 @@ index_info AS (
 
         fkeys = util.defaultdict(fkey_rec)
 
-        for r in connection.execute(s).fetchall():
+        for r in connection.execute(s).all():
             (
                 _,  # constraint schema
                 rfknm,
@@ -3497,4 +3671,13 @@ index_info AS (
             local_cols.append(scol)
             remote_cols.append(rcol)
 
-        return list(fkeys.values())
+        if fkeys:
+            return list(fkeys.values())
+        else:
+            return self._default_or_error(
+                connection,
+                tablename,
+                owner,
+                ReflectionDefaults.foreign_keys,
+                **kw,
+            )

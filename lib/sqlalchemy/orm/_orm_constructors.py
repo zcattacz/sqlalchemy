@@ -9,20 +9,21 @@ from __future__ import annotations
 
 import typing
 from typing import Any
+from typing import Callable
 from typing import Collection
-from typing import Dict
-from typing import List
+from typing import Iterable
+from typing import NoReturn
 from typing import Optional
 from typing import overload
-from typing import Set
 from typing import Type
+from typing import TYPE_CHECKING
 from typing import Union
 
-from . import mapper as mapperlib
-from .base import Mapped
+from . import mapperlib as mapperlib
+from ._typing import _O
 from .descriptor_props import Composite
 from .descriptor_props import Synonym
-from .mapper import Mapper
+from .interfaces import _AttributeOptions
 from .properties import ColumnProperty
 from .properties import MappedColumn
 from .query import AliasOption
@@ -36,11 +37,39 @@ from .util import LoaderCriteriaOption
 from .. import sql
 from .. import util
 from ..exc import InvalidRequestError
+from ..sql._typing import _no_kw
+from ..sql.base import _NoArg
 from ..sql.base import SchemaEventTarget
-from ..sql.selectable import Alias
+from ..sql.schema import SchemaConst
 from ..sql.selectable import FromClause
-from ..sql.type_api import TypeEngine
+from ..util.typing import Annotated
 from ..util.typing import Literal
+
+if TYPE_CHECKING:
+    from ._typing import _EntityType
+    from ._typing import _ORMColumnExprArgument
+    from .descriptor_props import _CC
+    from .descriptor_props import _CompositeAttrType
+    from .interfaces import PropComparator
+    from .mapper import Mapper
+    from .query import Query
+    from .relationships import _LazyLoadArgumentType
+    from .relationships import _ORMBackrefArgument
+    from .relationships import _ORMColCollectionArgument
+    from .relationships import _ORMOrderByArgument
+    from .relationships import _RelationshipJoinConditionArgument
+    from .session import _SessionBind
+    from ..sql._typing import _ColumnExpressionArgument
+    from ..sql._typing import _FromClauseArgument
+    from ..sql._typing import _InfoType
+    from ..sql._typing import _OnClauseArgument
+    from ..sql._typing import _TypeEngineArgument
+    from ..sql.elements import ColumnElement
+    from ..sql.schema import _ServerDefaultType
+    from ..sql.schema import FetchedValue
+    from ..sql.selectable import Alias
+    from ..sql.selectable import Subquery
+
 
 _T = typing.TypeVar("_T")
 
@@ -61,7 +90,7 @@ SynonymProperty = Synonym
     "for entities to be matched up to a query that is established "
     "via :meth:`.Query.from_statement` and now does nothing.",
 )
-def contains_alias(alias) -> AliasOption:
+def contains_alias(alias: Union[Alias, Subquery]) -> AliasOption:
     r"""Return a :class:`.MapperOption` that will indicate to the
     :class:`_query.Query`
     that the main table has been aliased.
@@ -70,265 +99,74 @@ def contains_alias(alias) -> AliasOption:
     return AliasOption(alias)
 
 
-# see test/ext/mypy/plain_files/mapped_column.py for mapped column
-# typing tests
-
-
-@overload
 def mapped_column(
-    __type: Union[Type[TypeEngine[_T]], TypeEngine[_T]],
+    __name_pos: Optional[
+        Union[str, _TypeEngineArgument[Any], SchemaEventTarget]
+    ] = None,
+    __type_pos: Optional[
+        Union[_TypeEngineArgument[Any], SchemaEventTarget]
+    ] = None,
     *args: SchemaEventTarget,
-    nullable: Literal[None] = ...,
-    primary_key: Literal[None] = ...,
-    deferred: bool = ...,
-    **kw: Any,
-) -> "MappedColumn[Any]":
-    ...
-
-
-@overload
-def mapped_column(
-    __name: str,
-    __type: Union[Type[TypeEngine[_T]], TypeEngine[_T]],
-    *args: SchemaEventTarget,
-    nullable: Literal[None] = ...,
-    primary_key: Literal[None] = ...,
-    deferred: bool = ...,
-    **kw: Any,
-) -> "MappedColumn[Any]":
-    ...
-
-
-@overload
-def mapped_column(
-    __name: str,
-    __type: Union[Type[TypeEngine[_T]], TypeEngine[_T]],
-    *args: SchemaEventTarget,
-    nullable: Literal[True] = ...,
-    primary_key: Literal[None] = ...,
-    deferred: bool = ...,
-    **kw: Any,
-) -> "MappedColumn[Optional[_T]]":
-    ...
-
-
-@overload
-def mapped_column(
-    __type: Union[Type[TypeEngine[_T]], TypeEngine[_T]],
-    *args: SchemaEventTarget,
-    nullable: Literal[True] = ...,
-    primary_key: Literal[None] = ...,
-    deferred: bool = ...,
-    **kw: Any,
-) -> "MappedColumn[Optional[_T]]":
-    ...
-
-
-@overload
-def mapped_column(
-    __name: str,
-    __type: Union[Type[TypeEngine[_T]], TypeEngine[_T]],
-    *args: SchemaEventTarget,
-    nullable: Literal[False] = ...,
-    primary_key: Literal[None] = ...,
-    deferred: bool = ...,
-    **kw: Any,
-) -> "MappedColumn[_T]":
-    ...
-
-
-@overload
-def mapped_column(
-    __type: Union[Type[TypeEngine[_T]], TypeEngine[_T]],
-    *args: SchemaEventTarget,
-    nullable: Literal[False] = ...,
-    primary_key: Literal[None] = ...,
-    deferred: bool = ...,
-    **kw: Any,
-) -> "MappedColumn[_T]":
-    ...
-
-
-@overload
-def mapped_column(
-    __type: Union[Type[TypeEngine[_T]], TypeEngine[_T]],
-    *args: SchemaEventTarget,
-    nullable: bool = ...,
-    primary_key: Literal[True] = ...,
-    deferred: bool = ...,
-    **kw: Any,
-) -> "MappedColumn[_T]":
-    ...
-
-
-@overload
-def mapped_column(
-    __name: str,
-    __type: Union[Type[TypeEngine[_T]], TypeEngine[_T]],
-    *args: SchemaEventTarget,
-    nullable: bool = ...,
-    primary_key: Literal[True] = ...,
-    deferred: bool = ...,
-    **kw: Any,
-) -> "MappedColumn[_T]":
-    ...
-
-
-@overload
-def mapped_column(
-    __name: str,
-    *args: SchemaEventTarget,
-    nullable: bool = ...,
-    primary_key: bool = ...,
-    deferred: bool = ...,
-    **kw: Any,
-) -> "MappedColumn[Any]":
-    ...
-
-
-@overload
-def mapped_column(
-    *args: SchemaEventTarget,
-    nullable: bool = ...,
-    primary_key: bool = ...,
-    deferred: bool = ...,
-    **kw: Any,
-) -> "MappedColumn[Any]":
-    ...
-
-
-def mapped_column(*args: Any, **kw: Any) -> "MappedColumn[Any]":
-    r"""construct a new ORM-mapped :class:`_schema.Column` construct.
+    init: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    default: Optional[Any] = _NoArg.NO_ARG,
+    default_factory: Union[_NoArg, Callable[[], _T]] = _NoArg.NO_ARG,
+    kw_only: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    nullable: Optional[
+        Union[bool, Literal[SchemaConst.NULL_UNSPECIFIED]]
+    ] = SchemaConst.NULL_UNSPECIFIED,
+    primary_key: Optional[bool] = False,
+    deferred: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    deferred_group: Optional[str] = None,
+    deferred_raiseload: bool = False,
+    name: Optional[str] = None,
+    type_: Optional[_TypeEngineArgument[Any]] = None,
+    autoincrement: Union[bool, Literal["auto", "ignore_fk"]] = "auto",
+    doc: Optional[str] = None,
+    key: Optional[str] = None,
+    index: Optional[bool] = None,
+    unique: Optional[bool] = None,
+    info: Optional[_InfoType] = None,
+    onupdate: Optional[Any] = None,
+    insert_default: Optional[Any] = _NoArg.NO_ARG,
+    server_default: Optional[_ServerDefaultType] = None,
+    server_onupdate: Optional[FetchedValue] = None,
+    quote: Optional[bool] = None,
+    system: bool = False,
+    comment: Optional[str] = None,
+    **dialect_kwargs: Any,
+) -> MappedColumn[Any]:
+    r"""declare a new ORM-mapped :class:`_schema.Column` construct
+    for use within :ref:`Declarative Table <orm_declarative_table>`
+    configuration.
 
     The :func:`_orm.mapped_column` function provides an ORM-aware and
     Python-typing-compatible construct which is used with
     :ref:`declarative <orm_declarative_mapping>` mappings to indicate an
     attribute that's mapped to a Core :class:`_schema.Column` object.  It
     provides the equivalent feature as mapping an attribute to a
-    :class:`_schema.Column` object directly when using declarative.
+    :class:`_schema.Column` object directly when using Declarative,
+    specifically when using :ref:`Declarative Table <orm_declarative_table>`
+    configuration.
 
     .. versionadded:: 2.0
 
     :func:`_orm.mapped_column` is normally used with explicit typing along with
-    the :class:`_orm.Mapped` mapped attribute type, where it can derive the SQL
-    type and nullability for the column automatically, such as::
+    the :class:`_orm.Mapped` annotation type, where it can derive the SQL
+    type and nullability for the column based on what's present within the
+    :class:`_orm.Mapped` annotation.   It also may be used without annotations
+    as a drop-in replacement for how :class:`_schema.Column` is used in
+    Declarative mappings in SQLAlchemy 1.x style.
 
-        from typing import Optional
+    For usage examples of :func:`_orm.mapped_column`, see the documentation
+    at :ref:`orm_declarative_table`.
 
-        from sqlalchemy.orm import Mapped
-        from sqlalchemy.orm import mapped_column
+    .. seealso::
 
-        class User(Base):
-            __tablename__ = 'user'
+        :ref:`orm_declarative_table` - complete documentation
 
-            id: Mapped[int] = mapped_column(primary_key=True)
-            name: Mapped[str] = mapped_column()
-            options: Mapped[Optional[str]] = mapped_column()
-
-    In the above example, the ``int`` and ``str`` types are inferred by the
-    Declarative mapping system to indicate use of the :class:`_types.Integer`
-    and :class:`_types.String` datatypes, and the presence of ``Optional`` or
-    not indicates whether or not each non-primary-key column is to be
-    ``nullable=True`` or ``nullable=False``.
-
-    The above example, when interpreted within a Declarative class, will result
-    in a table named ``"user"`` which is equivalent to the following::
-
-        from sqlalchemy import Integer
-        from sqlalchemy import String
-        from sqlalchemy import Table
-
-        Table(
-            'user',
-            Base.metadata,
-            Column("id", Integer, primary_key=True),
-            Column("name", String, nullable=False),
-            Column("options", String, nullable=True),
-        )
-
-    The :func:`_orm.mapped_column` construct accepts the same arguments as
-    that of :class:`_schema.Column` directly, including optional "name"
-    and "type" fields, so the above mapping can be stated more explicitly
-    as::
-
-        from typing import Optional
-
-        from sqlalchemy import Integer
-        from sqlalchemy import String
-        from sqlalchemy.orm import Mapped
-        from sqlalchemy.orm import mapped_column
-
-        class User(Base):
-            __tablename__ = 'user'
-
-            id: Mapped[int] = mapped_column("id", Integer, primary_key=True)
-            name: Mapped[str] = mapped_column("name", String, nullable=False)
-            options: Mapped[Optional[str]] = mapped_column(
-                "name", String, nullable=True
-            )
-
-    Arguments passed to :func:`_orm.mapped_column` always supersede those which
-    would be derived from the type annotation and/or attribute name. To state
-    the above mapping with more specific datatypes for ``id`` and ``options``,
-    and a different column name for ``name``, looks like::
-
-        from sqlalchemy import BigInteger
-
-        class User(Base):
-            __tablename__ = 'user'
-
-            id: Mapped[int] = mapped_column("id", BigInteger, primary_key=True)
-            name: Mapped[str] = mapped_column("user_name")
-            options: Mapped[Optional[str]] = mapped_column(String(50))
-
-    Where again, datatypes and nullable parameters that can be automatically
-    derived may be omitted.
-
-    The datatypes passed to :class:`_orm.Mapped` are mapped to SQL
-    :class:`_types.TypeEngine` types with the following default mapping::
-
-        _type_map = {
-            int: Integer(),
-            float: Float(),
-            bool: Boolean(),
-            decimal.Decimal: Numeric(),
-            dt.date: Date(),
-            dt.datetime: DateTime(),
-            dt.time: Time(),
-            dt.timedelta: Interval(),
-            util.NoneType: NULLTYPE,
-            bytes: LargeBinary(),
-            str: String(),
-        }
-
-    The above mapping may be expanded to include any combination of Python
-    datatypes to SQL types by using the
-    :paramref:`_orm.registry.type_annotation_map` parameter to
-    :class:`_orm.registry`, or as the attribute ``type_annotation_map`` upon
-    the :class:`_orm.DeclarativeBase` base class.
-
-    Finally, :func:`_orm.mapped_column` is implicitly used by the Declarative
-    mapping system for any :class:`_orm.Mapped` annotation that has no
-    attribute value set up.  This is much in the way that Python dataclasses
-    allow the ``field()`` construct to be optional, only needed when additional
-    parameters should be associated with the field.  Using this functionality,
-    our original mapping can be stated even more succinctly as::
-
-        from typing import Optional
-
-        from sqlalchemy.orm import Mapped
-        from sqlalchemy.orm import mapped_column
-
-        class User(Base):
-            __tablename__ = 'user'
-
-            id: Mapped[int] = mapped_column(primary_key=True)
-            name: Mapped[str]
-            options: Mapped[Optional[str]]
-
-    Above, the ``name`` and ``options`` columns will be evaluated as
-    ``Column("name", String, nullable=False)`` and
-    ``Column("options", String, nullable=True)``, respectively.
+        :ref:`whatsnew_20_orm_declarative_typing` - migration notes for
+        Declarative mappings using 1.x style mappings
 
     :param __name: String name to give to the :class:`_schema.Column`.  This
      is an optional, positional only argument that if present must be the
@@ -358,17 +196,110 @@ def mapped_column(*args: Any, **kw: Any) -> "MappedColumn[Any]":
      ORM declarative process, and is not part of the :class:`_schema.Column`
      itself; instead, it indicates that this column should be "deferred" for
      loading as though mapped by :func:`_orm.deferred`.
+
+     .. seealso::
+
+        :ref:`deferred`
+
+    :param deferred_group: Implies :paramref:`_orm.mapped_column.deferred`
+     to ``True``, and set the :paramref:`_orm.deferred.group` parameter.
+    :param deferred_raiseload: Implies :paramref:`_orm.mapped_column.deferred`
+     to ``True``, and set the :paramref:`_orm.deferred.raiseload` parameter.
+
+    :param default: Passed directly to the
+     :paramref:`_schema.Column.default` parameter if the
+     :paramref:`_orm.mapped_column.insert_default` parameter is not present.
+     Additionally, when used with :ref:`orm_declarative_native_dataclasses`,
+     indicates a default Python value that should be applied to the keyword
+     constructor within the generated ``__init__()`` method.
+
+     Note that in the case of dataclass generation when
+     :paramref:`_orm.mapped_column.insert_default` is not present, this means
+     the :paramref:`_orm.mapped_column.default` value is used in **two**
+     places, both the ``__init__()`` method as well as the
+     :paramref:`_schema.Column.default` parameter. While this behavior may
+     change in a future release, for the moment this tends to "work out"; a
+     default of ``None`` will mean that the :class:`_schema.Column` gets no
+     default generator, whereas a default that refers to a non-``None`` Python
+     or SQL expression value will be assigned up front on the object when
+     ``__init__()`` is called, which is the same value that the Core
+     :class:`_sql.Insert` construct would use in any case, leading to the same
+     end result.
+
+    :param insert_default: Passed directly to the
+     :paramref:`_schema.Column.default` parameter; will supersede the value
+     of :paramref:`_orm.mapped_column.default` when present, however
+     :paramref:`_orm.mapped_column.default` will always apply to the
+     constructor default for a dataclasses mapping.
+
+    :param init: Specific to :ref:`orm_declarative_native_dataclasses`,
+     specifies if the mapped attribute should be part of the ``__init__()``
+     method as generated by the dataclass process.
+    :param repr: Specific to :ref:`orm_declarative_native_dataclasses`,
+     specifies if the mapped attribute should be part of the ``__repr__()``
+     method as generated by the dataclass process.
+    :param default_factory: Specific to
+     :ref:`orm_declarative_native_dataclasses`,
+     specifies a default-value generation function that will take place
+     as part of the ``__init__()``
+     method as generated by the dataclass process.
+    :param kw_only: Specific to
+     :ref:`orm_declarative_native_dataclasses`, indicates if this field
+     should be marked as keyword-only when generating the ``__init__()``.
+
     :param \**kw: All remaining keyword argments are passed through to the
      constructor for the :class:`_schema.Column`.
 
     """
 
-    return MappedColumn(*args, **kw)
+    return MappedColumn(
+        __name_pos,
+        __type_pos,
+        *args,
+        name=name,
+        type_=type_,
+        autoincrement=autoincrement,
+        insert_default=insert_default,
+        attribute_options=_AttributeOptions(
+            init, repr, default, default_factory, kw_only
+        ),
+        doc=doc,
+        key=key,
+        index=index,
+        unique=unique,
+        info=info,
+        nullable=nullable,
+        onupdate=onupdate,
+        primary_key=primary_key,
+        server_default=server_default,
+        server_onupdate=server_onupdate,
+        quote=quote,
+        comment=comment,
+        system=system,
+        deferred=deferred,
+        deferred_group=deferred_group,
+        deferred_raiseload=deferred_raiseload,
+        **dialect_kwargs,
+    )
 
 
 def column_property(
-    column: sql.ColumnElement[_T], *additional_columns, **kwargs
-) -> "ColumnProperty[_T]":
+    column: _ORMColumnExprArgument[_T],
+    *additional_columns: _ORMColumnExprArgument[Any],
+    group: Optional[str] = None,
+    deferred: bool = False,
+    raiseload: bool = False,
+    comparator_factory: Optional[Type[PropComparator[_T]]] = None,
+    init: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    default: Optional[Any] = _NoArg.NO_ARG,
+    default_factory: Union[_NoArg, Callable[[], _T]] = _NoArg.NO_ARG,
+    kw_only: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    active_history: bool = False,
+    expire_on_flush: bool = True,
+    info: Optional[_InfoType] = None,
+    doc: Optional[str] = None,
+) -> ColumnProperty[_T]:
     r"""Provide a column-level property for use with a mapping.
 
     Column-based properties can normally be applied to the mapper's
@@ -425,7 +356,7 @@ def column_property(
         flush, that is, has any kind of "dirty" state within a flush.
         Setting this parameter to ``False`` will have the effect of
         leaving any existing value present after the flush proceeds.
-        Note however that the :class:`.Session` with default expiration
+        Note that the :class:`.Session` with default expiration
         settings still expires
         all attributes after a :meth:`.Session.commit` call, however.
 
@@ -452,31 +383,84 @@ def column_property(
         expressions
 
     """
-    return ColumnProperty(column, *additional_columns, **kwargs)
+    return ColumnProperty(
+        column,
+        *additional_columns,
+        attribute_options=_AttributeOptions(
+            init, repr, default, default_factory, kw_only
+        ),
+        group=group,
+        deferred=deferred,
+        raiseload=raiseload,
+        comparator_factory=comparator_factory,
+        active_history=active_history,
+        expire_on_flush=expire_on_flush,
+        info=info,
+        doc=doc,
+    )
 
 
 @overload
 def composite(
-    class_: Type[_T],
-    *attrs: Union[sql.ColumnElement[Any], MappedColumn, str, Mapped[Any]],
-    **kwargs: Any,
-) -> "Composite[_T]":
+    _class_or_attr: Type[_CC],
+    *attrs: _CompositeAttrType[Any],
+    group: Optional[str] = None,
+    deferred: bool = False,
+    raiseload: bool = False,
+    comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
+    active_history: bool = False,
+    init: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    default: Optional[Any] = _NoArg.NO_ARG,
+    default_factory: Union[_NoArg, Callable[[], _T]] = _NoArg.NO_ARG,
+    kw_only: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    info: Optional[_InfoType] = None,
+    doc: Optional[str] = None,
+    **__kw: Any,
+) -> Composite[_CC]:
     ...
 
 
 @overload
 def composite(
-    *attrs: Union[sql.ColumnElement[Any], MappedColumn, str, Mapped[Any]],
-    **kwargs: Any,
-) -> "Composite[Any]":
+    _class_or_attr: _CompositeAttrType[Any],
+    *attrs: _CompositeAttrType[Any],
+    group: Optional[str] = None,
+    deferred: bool = False,
+    raiseload: bool = False,
+    comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
+    active_history: bool = False,
+    init: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    default: Optional[Any] = _NoArg.NO_ARG,
+    default_factory: Union[_NoArg, Callable[[], _T]] = _NoArg.NO_ARG,
+    kw_only: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    info: Optional[_InfoType] = None,
+    doc: Optional[str] = None,
+    **__kw: Any,
+) -> Composite[Any]:
     ...
 
 
 def composite(
-    class_: Any = None,
-    *attrs: Union[sql.ColumnElement[Any], MappedColumn, str, Mapped[Any]],
-    **kwargs: Any,
-) -> "Composite[Any]":
+    _class_or_attr: Union[
+        None, Type[_CC], Callable[..., _CC], _CompositeAttrType[Any]
+    ] = None,
+    *attrs: _CompositeAttrType[Any],
+    group: Optional[str] = None,
+    deferred: bool = False,
+    raiseload: bool = False,
+    comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
+    active_history: bool = False,
+    init: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    default: Optional[Any] = _NoArg.NO_ARG,
+    default_factory: Union[_NoArg, Callable[[], _T]] = _NoArg.NO_ARG,
+    kw_only: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    info: Optional[_InfoType] = None,
+    doc: Optional[str] = None,
+    **__kw: Any,
+) -> Composite[Any]:
     r"""Return a composite column-based property for use with a Mapper.
 
     See the mapping documentation section :ref:`mapper_composite` for a
@@ -524,18 +508,49 @@ def composite(
     :param info: Optional data dictionary which will be populated into the
         :attr:`.MapperProperty.info` attribute of this object.
 
+    :param init: Specific to :ref:`orm_declarative_native_dataclasses`,
+     specifies if the mapped attribute should be part of the ``__init__()``
+     method as generated by the dataclass process.
+    :param repr: Specific to :ref:`orm_declarative_native_dataclasses`,
+     specifies if the mapped attribute should be part of the ``__repr__()``
+     method as generated by the dataclass process.
+    :param default_factory: Specific to
+     :ref:`orm_declarative_native_dataclasses`,
+     specifies a default-value generation function that will take place
+     as part of the ``__init__()``
+     method as generated by the dataclass process.
+    :param kw_only: Specific to
+     :ref:`orm_declarative_native_dataclasses`, indicates if this field
+     should be marked as keyword-only when generating the ``__init__()``.
+
     """
-    return Composite(class_, *attrs, **kwargs)
+    if __kw:
+        raise _no_kw()
+
+    return Composite(
+        _class_or_attr,
+        *attrs,
+        attribute_options=_AttributeOptions(
+            init, repr, default, default_factory, kw_only
+        ),
+        group=group,
+        deferred=deferred,
+        raiseload=raiseload,
+        comparator_factory=comparator_factory,
+        active_history=active_history,
+        info=info,
+        doc=doc,
+    )
 
 
 def with_loader_criteria(
-    entity_or_base,
-    where_criteria,
-    loader_only=False,
-    include_aliases=False,
-    propagate_to_loaders=True,
-    track_closure_variables=True,
-) -> "LoaderCriteriaOption":
+    entity_or_base: _EntityType[Any],
+    where_criteria: _ColumnExpressionArgument[bool],
+    loader_only: bool = False,
+    include_aliases: bool = False,
+    propagate_to_loaders: bool = True,
+    track_closure_variables: bool = True,
+) -> LoaderCriteriaOption:
     """Add additional WHERE criteria to the load for all occurrences of
     a particular entity.
 
@@ -676,11 +691,18 @@ def with_loader_criteria(
      accepts a target class as an argument, when the given class is
      a base with many different mapped subclasses.
 
+     .. note:: To support pickling, use a module-level Python function to
+        produce the SQL expression instead of a lambda or a fixed SQL
+        expression, which tend to not be picklable.
+
     :param include_aliases: if True, apply the rule to :func:`_orm.aliased`
      constructs as well.
 
     :param propagate_to_loaders: defaults to True, apply to relationship
-     loaders such as lazy loaders.
+     loaders such as lazy loaders.   This indicates that the
+     option object itself including SQL expression is carried along with
+     each loaded instance.  Set to ``False`` to prevent the object from
+     being assigned to individual instances.
 
 
      .. seealso::
@@ -711,266 +733,94 @@ def with_loader_criteria(
     )
 
 
-@overload
 def relationship(
-    argument: str,
-    secondary=...,
-    *,
-    uselist: bool = ...,
-    collection_class: Literal[None] = ...,
-    primaryjoin=...,
-    secondaryjoin=...,
-    back_populates=...,
-    **kw: Any,
-) -> Relationship[Any]:
-    ...
-
-
-@overload
-def relationship(
-    argument: str,
-    secondary=...,
-    *,
-    uselist: bool = ...,
-    collection_class: Type[Set] = ...,
-    primaryjoin=...,
-    secondaryjoin=...,
-    back_populates=...,
-    **kw: Any,
-) -> Relationship[Set[Any]]:
-    ...
-
-
-@overload
-def relationship(
-    argument: str,
-    secondary=...,
-    *,
-    uselist: bool = ...,
-    collection_class: Type[List] = ...,
-    primaryjoin=...,
-    secondaryjoin=...,
-    back_populates=...,
-    **kw: Any,
-) -> Relationship[List[Any]]:
-    ...
-
-
-@overload
-def relationship(
-    argument: Optional[_RelationshipArgumentType[_T]],
-    secondary=...,
-    *,
-    uselist: Literal[False] = ...,
-    collection_class: Literal[None] = ...,
-    primaryjoin=...,
-    secondaryjoin=...,
-    back_populates=...,
-    **kw: Any,
-) -> Relationship[_T]:
-    ...
-
-
-@overload
-def relationship(
-    argument: Optional[_RelationshipArgumentType[_T]],
-    secondary=...,
-    *,
-    uselist: Literal[True] = ...,
-    collection_class: Literal[None] = ...,
-    primaryjoin=...,
-    secondaryjoin=...,
-    back_populates=...,
-    **kw: Any,
-) -> Relationship[List[_T]]:
-    ...
-
-
-@overload
-def relationship(
-    argument: Optional[_RelationshipArgumentType[_T]],
-    secondary=...,
-    *,
-    uselist: Union[Literal[None], Literal[True]] = ...,
-    collection_class: Type[List] = ...,
-    primaryjoin=...,
-    secondaryjoin=...,
-    back_populates=...,
-    **kw: Any,
-) -> Relationship[List[_T]]:
-    ...
-
-
-@overload
-def relationship(
-    argument: Optional[_RelationshipArgumentType[_T]],
-    secondary=...,
-    *,
-    uselist: Union[Literal[None], Literal[True]] = ...,
-    collection_class: Type[Set] = ...,
-    primaryjoin=...,
-    secondaryjoin=...,
-    back_populates=...,
-    **kw: Any,
-) -> Relationship[Set[_T]]:
-    ...
-
-
-@overload
-def relationship(
-    argument: Optional[_RelationshipArgumentType[_T]],
-    secondary=...,
-    *,
-    uselist: Union[Literal[None], Literal[True]] = ...,
-    collection_class: Type[Dict[Any, Any]] = ...,
-    primaryjoin=...,
-    secondaryjoin=...,
-    back_populates=...,
-    **kw: Any,
-) -> Relationship[Dict[Any, _T]]:
-    ...
-
-
-@overload
-def relationship(
-    argument: _RelationshipArgumentType[_T],
-    secondary=...,
-    *,
-    uselist: Literal[None] = ...,
-    collection_class: Literal[None] = ...,
-    primaryjoin=...,
-    secondaryjoin=None,
-    back_populates=None,
-    **kw: Any,
-) -> Relationship[Any]:
-    ...
-
-
-@overload
-def relationship(
-    argument: Optional[_RelationshipArgumentType[_T]] = ...,
-    secondary=...,
-    *,
-    uselist: Literal[True] = ...,
-    collection_class: Any = ...,
-    primaryjoin=...,
-    secondaryjoin=...,
-    back_populates=...,
-    **kw: Any,
-) -> Relationship[Any]:
-    ...
-
-
-@overload
-def relationship(
-    argument: Literal[None] = ...,
-    secondary=...,
-    *,
-    uselist: Optional[bool] = ...,
-    collection_class: Any = ...,
-    primaryjoin=...,
-    secondaryjoin=...,
-    back_populates=...,
-    **kw: Any,
-) -> Relationship[Any]:
-    ...
-
-
-def relationship(
-    argument: Optional[_RelationshipArgumentType[_T]] = None,
-    secondary=None,
+    argument: Optional[_RelationshipArgumentType[Any]] = None,
+    secondary: Optional[Union[FromClause, str]] = None,
     *,
     uselist: Optional[bool] = None,
-    collection_class: Optional[Type[Collection]] = None,
-    primaryjoin=None,
-    secondaryjoin=None,
-    back_populates=None,
+    collection_class: Optional[
+        Union[Type[Collection[Any]], Callable[[], Collection[Any]]]
+    ] = None,
+    primaryjoin: Optional[_RelationshipJoinConditionArgument] = None,
+    secondaryjoin: Optional[_RelationshipJoinConditionArgument] = None,
+    back_populates: Optional[str] = None,
+    order_by: _ORMOrderByArgument = False,
+    backref: Optional[_ORMBackrefArgument] = None,
+    overlaps: Optional[str] = None,
+    post_update: bool = False,
+    cascade: str = "save-update, merge",
+    viewonly: bool = False,
+    init: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    default: Union[_NoArg, _T] = _NoArg.NO_ARG,
+    default_factory: Union[_NoArg, Callable[[], _T]] = _NoArg.NO_ARG,
+    kw_only: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    lazy: _LazyLoadArgumentType = "select",
+    passive_deletes: Union[Literal["all"], bool] = False,
+    passive_updates: bool = True,
+    active_history: bool = False,
+    enable_typechecks: bool = True,
+    foreign_keys: Optional[_ORMColCollectionArgument] = None,
+    remote_side: Optional[_ORMColCollectionArgument] = None,
+    join_depth: Optional[int] = None,
+    comparator_factory: Optional[Type[Relationship.Comparator[Any]]] = None,
+    single_parent: bool = False,
+    innerjoin: bool = False,
+    distinct_target_key: Optional[bool] = None,
+    load_on_pending: bool = False,
+    query_class: Optional[Type[Query[Any]]] = None,
+    info: Optional[_InfoType] = None,
+    omit_join: Literal[None, False] = None,
+    sync_backref: Optional[bool] = None,
     **kw: Any,
 ) -> Relationship[Any]:
     """Provide a relationship between two mapped classes.
 
     This corresponds to a parent-child or associative table relationship.
-    The constructed class is an instance of
-    :class:`.Relationship`.
-
-    A typical :func:`_orm.relationship`, used in a classical mapping::
-
-       mapper(Parent, properties={
-         'children': relationship(Child)
-       })
-
-    Some arguments accepted by :func:`_orm.relationship`
-    optionally accept a
-    callable function, which when called produces the desired value.
-    The callable is invoked by the parent :class:`_orm.Mapper` at "mapper
-    initialization" time, which happens only when mappers are first used,
-    and is assumed to be after all mappings have been constructed.  This
-    can be used to resolve order-of-declaration and other dependency
-    issues, such as if ``Child`` is declared below ``Parent`` in the same
-    file::
-
-        mapper(Parent, properties={
-            "children":relationship(lambda: Child,
-                                order_by=lambda: Child.id)
-        })
-
-    When using the :ref:`declarative_toplevel` extension, the Declarative
-    initializer allows string arguments to be passed to
-    :func:`_orm.relationship`.  These string arguments are converted into
-    callables that evaluate the string as Python code, using the
-    Declarative class-registry as a namespace.  This allows the lookup of
-    related classes to be automatic via their string name, and removes the
-    need for related classes to be imported into the local module space
-    before the dependent classes have been declared.  It is still required
-    that the modules in which these related classes appear are imported
-    anywhere in the application at some point before the related mappings
-    are actually used, else a lookup error will be raised when the
-    :func:`_orm.relationship`
-    attempts to resolve the string reference to the
-    related class.    An example of a string- resolved class is as
-    follows::
-
-        from sqlalchemy.ext.declarative import declarative_base
-
-        Base = declarative_base()
-
-        class Parent(Base):
-            __tablename__ = 'parent'
-            id = Column(Integer, primary_key=True)
-            children = relationship("Child", order_by="Child.id")
+    The constructed class is an instance of :class:`.Relationship`.
 
     .. seealso::
 
-      :ref:`relationship_config_toplevel` - Full introductory and
-      reference documentation for :func:`_orm.relationship`.
+        :ref:`tutorial_orm_related_objects` - tutorial introduction
+        to :func:`_orm.relationship` in the :ref:`unified_tutorial`
 
-      :ref:`orm_tutorial_relationship` - ORM tutorial introduction.
+        :ref:`relationship_config_toplevel` - narrative documentation
 
     :param argument:
-      A mapped class, or actual :class:`_orm.Mapper` instance,
-      representing
-      the target of the relationship.
+      This parameter refers to the class that is to be related.   It
+      accepts several forms, including a direct reference to the target
+      class itself, the :class:`_orm.Mapper` instance for the target class,
+      a Python callable / lambda that will return a reference to the
+      class or :class:`_orm.Mapper` when called, and finally a string
+      name for the class, which will be resolved from the
+      :class:`_orm.registry` in use in order to locate the class, e.g.::
 
-      :paramref:`_orm.relationship.argument`
-      may also be passed as a callable
-      function which is evaluated at mapper initialization time, and may
-      be passed as a string name when using Declarative.
+            class SomeClass(Base):
+                # ...
 
-      .. warning:: Prior to SQLAlchemy 1.3.16, this value is interpreted
-         using Python's ``eval()`` function.
-         **DO NOT PASS UNTRUSTED INPUT TO THIS STRING**.
-         See :ref:`declarative_relationship_eval` for details on
-         declarative evaluation of :func:`_orm.relationship` arguments.
+                related = relationship("RelatedClass")
 
-      .. versionchanged 1.3.16::
+      The :paramref:`_orm.relationship.argument` may also be omitted from the
+      :func:`_orm.relationship` construct entirely, and instead placed inside
+      a :class:`_orm.Mapped` annotation on the left side, which should
+      include a Python collection type if the relationship is expected
+      to be a collection, such as::
 
-         The string evaluation of the main "argument" no longer accepts an
-         open ended Python expression, instead only accepting a string
-         class name or dotted package-qualified name.
+            class SomeClass(Base):
+                # ...
+
+                related_items: Mapped[List["RelatedItem"]] = relationship()
+
+      Or for a many-to-one or one-to-one relationship::
+
+            class SomeClass(Base):
+                # ...
+
+                related_item: Mapped["RelatedItem"] = relationship()
 
       .. seealso::
 
-        :ref:`declarative_configuring_relationships` - further detail
+        :ref:`orm_declarative_properties` - further detail
         on relationship configuration when using Declarative.
 
     :param secondary:
@@ -1011,9 +861,6 @@ def relationship(
           :ref:`relationships_many_to_many` - Reference example of "many
           to many".
 
-          :ref:`orm_tutorial_many_to_many` - ORM tutorial introduction to
-          many-to-many relationships.
-
           :ref:`self_referential_many_to_many` - Specifics on using
           many-to-many in a self-referential case.
 
@@ -1046,41 +893,50 @@ def relationship(
       the "previous" value of the attribute.
 
     :param backref:
-      Indicates the string name of a property to be placed on the related
-      mapper's class that will handle this relationship in the other
-      direction. The other property will be created automatically
-      when the mappers are configured.  Can also be passed as a
-      :func:`.backref` object to control the configuration of the
-      new relationship.
+      A reference to a string relationship name, or a :func:`_orm.backref`
+      construct, which will be used to automatically generate a new
+      :func:`_orm.relationship` on the related class, which then refers to this
+      one using a bi-directional :paramref:`_orm.relationship.back_populates`
+      configuration.
+
+      In modern Python, explicit use of :func:`_orm.relationship`
+      with :paramref:`_orm.relationship.back_populates` should be preferred,
+      as it is more robust in terms of mapper configuration as well as
+      more conceptually straightforward.  It also integrates with
+      new :pep:`484` typing features introduced in SQLAlchemy 2.0 which
+      is not possible with dynamically generated attributes.
 
       .. seealso::
 
-        :ref:`relationships_backref` - Introductory documentation and
-        examples.
+        :ref:`relationships_backref` - notes on using
+        :paramref:`_orm.relationship.backref`
 
-        :paramref:`_orm.relationship.back_populates` - alternative form
-        of backref specification.
+        :ref:`tutorial_orm_related_objects` - in the :ref:`unified_tutorial`,
+        presents an overview of bi-directional relationship configuration
+        and behaviors using :paramref:`_orm.relationship.back_populates`
 
         :func:`.backref` - allows control over :func:`_orm.relationship`
         configuration when using :paramref:`_orm.relationship.backref`.
 
 
     :param back_populates:
-      Takes a string name and has the same meaning as
-      :paramref:`_orm.relationship.backref`, except the complementing
-      property is **not** created automatically, and instead must be
-      configured explicitly on the other mapper.  The complementing
-      property should also indicate
-      :paramref:`_orm.relationship.back_populates` to this relationship to
-      ensure proper functioning.
+      Indicates the name of a :func:`_orm.relationship` on the related
+      class that will be synchronized with this one.   It is usually
+      expected that the :func:`_orm.relationship` on the related class
+      also refer to this one.  This allows objects on both sides of
+      each :func:`_orm.relationship` to synchronize in-Python state
+      changes and also provides directives to the :term:`unit of work`
+      flush process how changes along these relationships should
+      be persisted.
 
       .. seealso::
 
-        :ref:`relationships_backref` - Introductory documentation and
-        examples.
+        :ref:`tutorial_orm_related_objects` - in the :ref:`unified_tutorial`,
+        presents an overview of bi-directional relationship configuration
+        and behaviors.
 
-        :paramref:`_orm.relationship.backref` - alternative form
-        of backref specification.
+        :ref:`relationship_patterns` - includes many examples of
+        :paramref:`_orm.relationship.back_populates`.
 
     :param overlaps:
        A string name or comma-delimited set of names of other relationships
@@ -1097,22 +953,6 @@ def relationship(
        .. seealso::
 
             :ref:`error_qzyx` - usage example
-
-    :param bake_queries=True:
-      Enable :ref:`lambda caching <engine_lambda_caching>` for loader
-      strategies, if applicable, which adds a performance gain to the
-      construction of SQL constructs used by loader strategies, in addition
-      to the usual SQL statement caching used throughout SQLAlchemy. This
-      parameter currently applies only to the "lazy" and "selectin" loader
-      strategies. There is generally no reason to set this parameter to
-      False.
-
-      .. versionchanged:: 1.4  Relationship loaders no longer use the
-         previous "baked query" system of query caching.   The "lazy"
-         and "selectin" loaders make use of the "lambda cache" system
-         for the construction of SQL constructs,
-         as well as the usual SQL caching system that is throughout
-         SQLAlchemy as of the 1.4 series.
 
     :param cascade:
       A comma-separated list of cascade rules which determines how
@@ -1132,9 +972,6 @@ def relationship(
 
         :ref:`unitofwork_cascades` - Full detail on each of the available
         cascade options.
-
-        :ref:`tutorial_delete_cascade` - Tutorial example describing
-        a delete cascade.
 
     :param cascade_backrefs=False:
       Legacy; this flag is always False.
@@ -1608,13 +1445,17 @@ def relationship(
       A boolean that indicates if this property should be loaded as a
       list or a scalar. In most cases, this value is determined
       automatically by :func:`_orm.relationship` at mapper configuration
-      time, based on the type and direction
+      time.  When using explicit :class:`_orm.Mapped` annotations,
+      :paramref:`_orm.relationship.uselist` may be derived from the
+      whether or not the annotation within :class:`_orm.Mapped` contains
+      a collection class.
+      Otherwise, :paramref:`_orm.relationship.uselist` may be derived from
+      the type and direction
       of the relationship - one to many forms a list, many to one
       forms a scalar, many to many is a list. If a scalar is desired
       where normally a list would be present, such as a bi-directional
-      one-to-one relationship, set :paramref:`_orm.relationship.uselist`
-      to
-      False.
+      one-to-one relationship, use an appropriate :class:`_orm.Mapped`
+      annotation or set :paramref:`_orm.relationship.uselist` to False.
 
       The :paramref:`_orm.relationship.uselist`
       flag is also available on an
@@ -1630,8 +1471,8 @@ def relationship(
       .. seealso::
 
           :ref:`relationships_one_to_one` - Introduction to the "one to
-          one" relationship pattern, which is typically when the
-          :paramref:`_orm.relationship.uselist` flag is needed.
+          one" relationship pattern, which is typically when an alternate
+          setting for :paramref:`_orm.relationship.uselist` is involved.
 
     :param viewonly=False:
       When set to ``True``, the relationship is used only for loading
@@ -1700,6 +1541,21 @@ def relationship(
 
       .. versionadded:: 1.3
 
+    :param init: Specific to :ref:`orm_declarative_native_dataclasses`,
+     specifies if the mapped attribute should be part of the ``__init__()``
+     method as generated by the dataclass process.
+    :param repr: Specific to :ref:`orm_declarative_native_dataclasses`,
+     specifies if the mapped attribute should be part of the ``__repr__()``
+     method as generated by the dataclass process.
+    :param default_factory: Specific to
+     :ref:`orm_declarative_native_dataclasses`,
+     specifies a default-value generation function that will take place
+     as part of the ``__init__()``
+     method as generated by the dataclass process.
+    :param kw_only: Specific to
+     :ref:`orm_declarative_native_dataclasses`, indicates if this field
+     should be marked as keyword-only when generating the ``__init__()``.
+
 
     """
     return Relationship(
@@ -1710,18 +1566,50 @@ def relationship(
         primaryjoin=primaryjoin,
         secondaryjoin=secondaryjoin,
         back_populates=back_populates,
+        order_by=order_by,
+        backref=backref,
+        overlaps=overlaps,
+        post_update=post_update,
+        cascade=cascade,
+        viewonly=viewonly,
+        attribute_options=_AttributeOptions(
+            init, repr, default, default_factory, kw_only
+        ),
+        lazy=lazy,
+        passive_deletes=passive_deletes,
+        passive_updates=passive_updates,
+        active_history=active_history,
+        enable_typechecks=enable_typechecks,
+        foreign_keys=foreign_keys,
+        remote_side=remote_side,
+        join_depth=join_depth,
+        comparator_factory=comparator_factory,
+        single_parent=single_parent,
+        innerjoin=innerjoin,
+        distinct_target_key=distinct_target_key,
+        load_on_pending=load_on_pending,
+        query_class=query_class,
+        info=info,
+        omit_join=omit_join,
+        sync_backref=sync_backref,
         **kw,
     )
 
 
 def synonym(
-    name,
-    map_column=None,
-    descriptor=None,
-    comparator_factory=None,
-    doc=None,
-    info=None,
-) -> "Synonym[Any]":
+    name: str,
+    *,
+    map_column: Optional[bool] = None,
+    descriptor: Optional[Any] = None,
+    comparator_factory: Optional[Type[PropComparator[_T]]] = None,
+    init: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    default: Union[_NoArg, _T] = _NoArg.NO_ARG,
+    default_factory: Union[_NoArg, Callable[[], _T]] = _NoArg.NO_ARG,
+    kw_only: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    info: Optional[_InfoType] = None,
+    doc: Optional[str] = None,
+) -> Synonym[Any]:
     """Denote an attribute name as a synonym to a mapped property,
     in that the attribute will mirror the value and expression behavior
     of another attribute.
@@ -1825,10 +1713,22 @@ def synonym(
         than can be achieved with synonyms.
 
     """
-    return Synonym(name, map_column, descriptor, comparator_factory, doc, info)
+    return Synonym(
+        name,
+        map_column=map_column,
+        descriptor=descriptor,
+        comparator_factory=comparator_factory,
+        attribute_options=_AttributeOptions(
+            init, repr, default, default_factory, kw_only
+        ),
+        doc=doc,
+        info=info,
+    )
 
 
-def create_session(bind=None, **kwargs):
+def create_session(
+    bind: Optional[_SessionBind] = None, **kwargs: Any
+) -> Session:
     r"""Create a new :class:`.Session`
     with no automation enabled by default.
 
@@ -1864,7 +1764,7 @@ def create_session(bind=None, **kwargs):
     return Session(bind=bind, **kwargs)
 
 
-def _mapper_fn(*arg, **kw):
+def _mapper_fn(*arg: Any, **kw: Any) -> NoReturn:
     """Placeholder for the now-removed ``mapper()`` function.
 
     Classical mappings should be performed using the
@@ -1891,7 +1791,9 @@ def _mapper_fn(*arg, **kw):
     )
 
 
-def dynamic_loader(argument, **kw):
+def dynamic_loader(
+    argument: Optional[_RelationshipArgumentType[Any]] = None, **kw: Any
+) -> Relationship[Any]:
     """Construct a dynamically-loading mapper property.
 
     This is essentially the same as
@@ -1911,28 +1813,53 @@ def dynamic_loader(argument, **kw):
     return relationship(argument, **kw)
 
 
-def backref(name, **kwargs):
-    """Create a back reference with explicit keyword arguments, which are the
-    same arguments one can send to :func:`relationship`.
+def backref(name: str, **kwargs: Any) -> _ORMBackrefArgument:
+    """When using the :paramref:`_orm.relationship.backref` parameter,
+    provides specific parameters to be used when the new
+    :func:`_orm.relationship` is generated.
 
-    Used with the ``backref`` keyword argument to :func:`relationship` in
-    place of a string argument, e.g.::
+    E.g.::
 
         'items':relationship(
             SomeItem, backref=backref('parent', lazy='subquery'))
 
+    The :paramref:`_orm.relationship.backref` parameter is generally
+    considered to be legacy; for modern applications, using
+    explicit :func:`_orm.relationship` constructs linked together using
+    the :paramref:`_orm.relationship.back_populates` parameter should be
+    preferred.
+
     .. seealso::
 
-        :ref:`relationships_backref`
+        :ref:`relationships_backref` - background on backrefs
 
     """
 
     return (name, kwargs)
 
 
-def deferred(*columns, **kw):
+def deferred(
+    column: _ORMColumnExprArgument[_T],
+    *additional_columns: _ORMColumnExprArgument[Any],
+    group: Optional[str] = None,
+    raiseload: bool = False,
+    comparator_factory: Optional[Type[PropComparator[_T]]] = None,
+    init: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    default: Optional[Any] = _NoArg.NO_ARG,
+    default_factory: Union[_NoArg, Callable[[], _T]] = _NoArg.NO_ARG,
+    kw_only: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    active_history: bool = False,
+    expire_on_flush: bool = True,
+    info: Optional[_InfoType] = None,
+    doc: Optional[str] = None,
+) -> ColumnProperty[_T]:
     r"""Indicate a column-based mapped attribute that by default will
     not load unless accessed.
+
+    When using :func:`_orm.mapped_column`, the same functionality as
+    that of :func:`_orm.deferred` construct is provided by using the
+    :paramref:`_orm.mapped_column.deferred` parameter.
 
     :param \*columns: columns to be mapped.  This is typically a single
      :class:`_schema.Column` object,
@@ -1944,24 +1871,41 @@ def deferred(*columns, **kw):
 
      .. versionadded:: 1.4
 
-     .. seealso::
 
-        :ref:`deferred_raiseload`
-
-    :param \**kw: additional keyword arguments passed to
-     :class:`.ColumnProperty`.
+    Additional arguments are the same as that of :func:`_orm.column_property`.
 
     .. seealso::
 
         :ref:`deferred`
 
+        :ref:`deferred_raiseload`
+
     """
-    return ColumnProperty(deferred=True, *columns, **kw)
+    return ColumnProperty(
+        column,
+        *additional_columns,
+        attribute_options=_AttributeOptions(
+            init, repr, default, default_factory, kw_only
+        ),
+        group=group,
+        deferred=True,
+        raiseload=raiseload,
+        comparator_factory=comparator_factory,
+        active_history=active_history,
+        expire_on_flush=expire_on_flush,
+        info=info,
+        doc=doc,
+    )
 
 
 def query_expression(
-    default_expr: sql.ColumnElement[_T] = sql.null(),
-) -> "Mapped[_T]":
+    default_expr: _ORMColumnExprArgument[_T] = sql.null(),
+    *,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    expire_on_flush: bool = True,
+    info: Optional[_InfoType] = None,
+    doc: Optional[str] = None,
+) -> ColumnProperty[_T]:
     """Indicate an attribute that populates from a query-time SQL expression.
 
     :param default_expr: Optional SQL expression object that will be used in
@@ -1984,12 +1928,24 @@ def query_expression(
         :ref:`mapper_querytime_expression`
 
     """
-    prop = ColumnProperty(default_expr)
+    prop = ColumnProperty(
+        default_expr,
+        attribute_options=_AttributeOptions(
+            _NoArg.NO_ARG,
+            repr,
+            _NoArg.NO_ARG,
+            _NoArg.NO_ARG,
+            _NoArg.NO_ARG,
+        ),
+        expire_on_flush=expire_on_flush,
+        info=info,
+        doc=doc,
+    )
     prop.strategy_key = (("query_expression", True),)
     return prop
 
 
-def clear_mappers():
+def clear_mappers() -> None:
     """Remove all mappers from all classes.
 
     .. versionchanged:: 1.4  This function now locates all
@@ -2017,35 +1973,53 @@ def clear_mappers():
     mapperlib._dispose_registries(mapperlib._all_registries(), False)
 
 
+# I would really like a way to get the Type[] here that shows up
+# in a different way in typing tools, however there is no current method
+# that is accepted by mypy (subclass of Type[_O] works in pylance, rejected
+# by mypy).
+AliasedType = Annotated[Type[_O], "aliased"]
+
+
 @overload
 def aliased(
-    element: Union[Type[_T], "Mapper[_T]", "AliasedClass[_T]"],
-    alias=None,
-    name=None,
-    flat=False,
-    adapt_on_names=False,
-) -> "AliasedClass[_T]":
+    element: Type[_O],
+    alias: Optional[Union[Alias, Subquery]] = None,
+    name: Optional[str] = None,
+    flat: bool = False,
+    adapt_on_names: bool = False,
+) -> AliasedType[_O]:
     ...
 
 
 @overload
 def aliased(
-    element: "FromClause",
-    alias=None,
-    name=None,
-    flat=False,
-    adapt_on_names=False,
-) -> "Alias":
+    element: Union[AliasedClass[_O], Mapper[_O], AliasedInsp[_O]],
+    alias: Optional[Union[Alias, Subquery]] = None,
+    name: Optional[str] = None,
+    flat: bool = False,
+    adapt_on_names: bool = False,
+) -> AliasedClass[_O]:
+    ...
+
+
+@overload
+def aliased(
+    element: FromClause,
+    alias: Optional[Union[Alias, Subquery]] = None,
+    name: Optional[str] = None,
+    flat: bool = False,
+    adapt_on_names: bool = False,
+) -> FromClause:
     ...
 
 
 def aliased(
-    element: Union[Type[_T], "Mapper[_T]", "FromClause", "AliasedClass[_T]"],
-    alias=None,
-    name=None,
-    flat=False,
-    adapt_on_names=False,
-) -> Union["AliasedClass[_T]", "Alias"]:
+    element: Union[_EntityType[_O], FromClause],
+    alias: Optional[Union[Alias, Subquery]] = None,
+    name: Optional[str] = None,
+    flat: bool = False,
+    adapt_on_names: bool = False,
+) -> Union[AliasedClass[_O], FromClause, AliasedType[_O]]:
     """Produce an alias of the given element, usually an :class:`.AliasedClass`
     instance.
 
@@ -2053,7 +2027,8 @@ def aliased(
 
         my_alias = aliased(MyClass)
 
-        session.query(MyClass, my_alias).filter(MyClass.id > my_alias.id)
+        stmt = select(MyClass, my_alias).filter(MyClass.id > my_alias.id)
+        result = session.execute(stmt)
 
     The :func:`.aliased` function is used to create an ad-hoc mapping of a
     mapped class to a new selectable.  By default, a selectable is generated
@@ -2082,8 +2057,6 @@ def aliased(
         :ref:`tutorial_orm_entity_aliases` - in the :ref:`unified_tutorial`
 
         :ref:`orm_queryguide_orm_aliases` - in the :ref:`queryguide_toplevel`
-
-    :ref:`ormtutorial_aliases` - in the legacy :ref:`ormtutorial_toplevel`
 
     :param element: element to be aliased.  Is normally a mapped class,
      but for convenience can also be a :class:`_expression.FromClause`
@@ -2149,16 +2122,16 @@ def aliased(
 
 
 def with_polymorphic(
-    base,
-    classes,
-    selectable=False,
-    flat=False,
-    polymorphic_on=None,
-    aliased=False,
-    adapt_on_names=False,
-    innerjoin=False,
-    _use_mapper_path=False,
-):
+    base: Union[_O, Mapper[_O]],
+    classes: Iterable[Type[Any]],
+    selectable: Union[Literal[False, None], FromClause] = False,
+    flat: bool = False,
+    polymorphic_on: Optional[ColumnElement[Any]] = None,
+    aliased: bool = False,
+    innerjoin: bool = False,
+    adapt_on_names: bool = False,
+    _use_mapper_path: bool = False,
+) -> AliasedClass[_O]:
     """Produce an :class:`.AliasedClass` construct which specifies
     columns for descendant mappers of the given base.
 
@@ -2243,8 +2216,12 @@ def with_polymorphic(
 
 
 def join(
-    left, right, onclause=None, isouter=False, full=False, join_to_left=None
-):
+    left: _FromClauseArgument,
+    right: _FromClauseArgument,
+    onclause: Optional[_OnClauseArgument] = None,
+    isouter: bool = False,
+    full: bool = False,
+) -> _ORMJoin:
     r"""Produce an inner join between left and right clauses.
 
     :func:`_orm.join` is an extension to the core join interface
@@ -2252,42 +2229,43 @@ def join(
     left and right selectables may be not only core selectable
     objects such as :class:`_schema.Table`, but also mapped classes or
     :class:`.AliasedClass` instances.   The "on" clause can
-    be a SQL expression, or an attribute or string name
+    be a SQL expression or an ORM mapped attribute
     referencing a configured :func:`_orm.relationship`.
 
     :func:`_orm.join` is not commonly needed in modern usage,
     as its functionality is encapsulated within that of the
-    :meth:`_query.Query.join` method, which features a
+    :meth:`_sql.Select.join` and :meth:`_query.Query.join`
+    methods. which feature a
     significant amount of automation beyond :func:`_orm.join`
-    by itself.  Explicit usage of :func:`_orm.join`
-    with :class:`_query.Query` involves usage of the
-    :meth:`_query.Query.select_from` method, as in::
+    by itself.  Explicit use of :func:`_orm.join`
+    with ORM-enabled SELECT statements involves use of the
+    :meth:`_sql.Select.select_from` method, as in::
 
         from sqlalchemy.orm import join
-        session.query(User).\
+        stmt = select(User).\
             select_from(join(User, Address, User.addresses)).\
             filter(Address.email_address=='foo@bar.com')
 
     In modern SQLAlchemy the above join can be written more
     succinctly as::
 
-        session.query(User).\
+        stmt = select(User).\
                 join(User.addresses).\
                 filter(Address.email_address=='foo@bar.com')
 
-    See :meth:`_query.Query.join` for information on modern usage
+    See :ref:`orm_queryguide_joins` for information on modern usage
     of ORM level joins.
-
-    .. deprecated:: 0.8
-
-        the ``join_to_left`` parameter is deprecated, and will be removed
-        in a future release.  The parameter has no effect.
 
     """
     return _ORMJoin(left, right, onclause, isouter, full)
 
 
-def outerjoin(left, right, onclause=None, full=False, join_to_left=None):
+def outerjoin(
+    left: _FromClauseArgument,
+    right: _FromClauseArgument,
+    onclause: Optional[_OnClauseArgument] = None,
+    full: bool = False,
+) -> _ORMJoin:
     """Produce a left outer join between left and right clauses.
 
     This is the "outer join" version of the :func:`_orm.join` function,

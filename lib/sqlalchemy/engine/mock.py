@@ -21,17 +21,16 @@ from .. import util
 
 
 if typing.TYPE_CHECKING:
-    from .base import Connection
     from .base import Engine
     from .interfaces import _CoreAnyExecuteParams
     from .interfaces import _ExecuteOptionsParameter
     from .interfaces import Dialect
     from .url import URL
     from ..sql.base import Executable
-    from ..sql.ddl import DDLElement
     from ..sql.ddl import SchemaDropper
     from ..sql.ddl import SchemaGenerator
     from ..sql.schema import HasSchemaAttr
+    from ..sql.schema import SchemaItem
 
 
 class MockConnection:
@@ -55,7 +54,7 @@ class MockConnection:
     def _run_ddl_visitor(
         self,
         visitorcallable: Type[Union[SchemaGenerator, SchemaDropper]],
-        element: DDLElement,
+        element: SchemaItem,
         **kwargs: Any,
     ) -> None:
         kwargs["checkfirst"] = False
@@ -100,8 +99,8 @@ def create_mock_engine(url: URL, executor: Any, **kw: Any) -> MockConnection:
 
     :param executor: a callable which receives the arguments ``sql``,
      ``*multiparams`` and ``**params``.  The ``sql`` parameter is typically
-     an instance of :class:`.DDLElement`, which can then be compiled into a
-     string using :meth:`.DDLElement.compile`.
+     an instance of :class:`.ExecutableDDLElement`, which can then be compiled
+     into a string using :meth:`.ExecutableDDLElement.compile`.
 
     .. versionadded:: 1.4 - the :func:`.create_mock_engine` function replaces
        the previous "mock" engine strategy used with

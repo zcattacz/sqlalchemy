@@ -4,6 +4,7 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: allow-untyped-defs, allow-untyped-calls
 
 """Default implementations of per-dialect sqlalchemy.engine classes.
 
@@ -44,31 +45,35 @@ from .interfaces import CacheStats
 from .interfaces import DBAPICursor
 from .interfaces import Dialect
 from .interfaces import ExecutionContext
+from .reflection import ObjectKind
+from .reflection import ObjectScope
 from .. import event
 from .. import exc
 from .. import pool
-from .. import types as sqltypes
 from .. import util
 from ..sql import compiler
 from ..sql import expression
+from ..sql import type_api
 from ..sql._typing import is_tuple_type
 from ..sql.compiler import DDLCompiler
 from ..sql.compiler import SQLCompiler
 from ..sql.elements import quoted_name
+from ..sql.schema import default_is_scalar
+from ..util.typing import Literal
 
 if typing.TYPE_CHECKING:
-    from .base import Connection
+    from types import ModuleType
+
     from .base import Engine
-    from .characteristics import ConnectionCharacteristic
-    from .interfaces import _AnyMultiExecuteParams
     from .interfaces import _CoreMultiExecuteParams
     from .interfaces import _CoreSingleExecuteParams
-    from .interfaces import _DBAPIAnyExecuteParams
+    from .interfaces import _DBAPICursorDescription
     from .interfaces import _DBAPIMultiExecuteParams
-    from .interfaces import _DBAPISingleExecuteParams
     from .interfaces import _ExecuteOptions
+    from .interfaces import _IsolationLevel
     from .interfaces import _MutableCoreSingleExecuteParams
-    from .result import _ProcessorType
+    from .interfaces import _ParamStyle
+    from .interfaces import DBAPIConnection
     from .row import Row
     from .url import URL
     from ..event import _ListenerFnType
@@ -76,12 +81,13 @@ if typing.TYPE_CHECKING:
     from ..pool import PoolProxiedConnection
     from ..sql import Executable
     from ..sql.compiler import Compiled
+    from ..sql.compiler import Linting
     from ..sql.compiler import ResultColumnsEntry
-    from ..sql.compiler import TypeCompiler
     from ..sql.dml import DMLState
+    from ..sql.dml import UpdateBase
     from ..sql.elements import BindParameter
     from ..sql.schema import Column
-    from ..sql.schema import ColumnDefault
+    from ..sql.type_api import _BindProcessorType
     from ..sql.type_api import TypeEngine
 
 # When we're handed literal SQL, ensure it's a SELECT query
@@ -102,14 +108,12 @@ class DefaultDialect(Dialect):
 
     statement_compiler = compiler.SQLCompiler
     ddl_compiler = compiler.DDLCompiler
-    if typing.TYPE_CHECKING:
-        type_compiler: TypeCompiler
-    else:
-        type_compiler = compiler.GenericTypeCompiler
+    type_compiler_cls = compiler.GenericTypeCompiler
 
     preparer = compiler.IdentifierPreparer
     supports_alter = True
     supports_comments = False
+    supports_constraint_comments = False
     inline_comments = False
     supports_statement_cache = True
 
@@ -135,14 +139,20 @@ class DefaultDialect(Dialect):
     preexecute_autoincrement_sequences = False
     supports_identity_columns = False
     postfetch_lastrowid = True
-    implicit_returning = False
-    full_returning = False
+    favor_returning_over_lastrowid = False
+    insert_null_pk_still_autoincrements = False
+    update_returning = False
+    delete_returning = False
+    update_returning_multifrom = False
+    delete_returning_multifrom = False
+    insert_returning = False
     insert_executemany_returning = False
 
     cte_follows_insert = False
 
     supports_native_enum = False
     supports_native_boolean = False
+    supports_native_uuid = False
     non_native_boolean_check_constraint = True
 
     supports_simple_order_by_label = True
@@ -253,20 +263,19 @@ class DefaultDialect(Dialect):
     )
     def __init__(
         self,
-        paramstyle=None,
-        isolation_level=None,
-        dbapi=None,
-        implicit_returning=None,
-        supports_native_boolean=None,
-        max_identifier_length=None,
-        label_length=None,
-        # int() is because the @deprecated_params decorator cannot accommodate
-        # the direct reference to the "NO_LINTING" object
-        compiler_linting=int(compiler.NO_LINTING),
-        server_side_cursors=False,
-        **kwargs,
+        paramstyle: Optional[_ParamStyle] = None,
+        isolation_level: Optional[_IsolationLevel] = None,
+        dbapi: Optional[ModuleType] = None,
+        implicit_returning: Literal[True] = True,
+        supports_native_boolean: Optional[bool] = None,
+        max_identifier_length: Optional[int] = None,
+        label_length: Optional[int] = None,
+        # util.deprecated_params decorator cannot render the
+        # Linting.NO_LINTING constant
+        compiler_linting: Linting = int(compiler.NO_LINTING),  # type: ignore
+        server_side_cursors: bool = False,
+        **kwargs: Any,
     ):
-
         if server_side_cursors:
             if not self.supports_server_side_cursors:
                 raise exc.ArgumentError(
@@ -286,24 +295,30 @@ class DefaultDialect(Dialect):
 
         self.positional = False
         self._ischema = None
+
         self.dbapi = dbapi
+
         if paramstyle is not None:
             self.paramstyle = paramstyle
         elif self.dbapi is not None:
             self.paramstyle = self.dbapi.paramstyle
         else:
             self.paramstyle = self.default_paramstyle
-        if implicit_returning is not None:
-            self.implicit_returning = implicit_returning
         self.positional = self.paramstyle in ("qmark", "format", "numeric")
         self.identifier_preparer = self.preparer(self)
         self._on_connect_isolation_level = isolation_level
 
-        tt_callable = cast(
-            Type[compiler.GenericTypeCompiler],
-            self.type_compiler,
-        )
-        self.type_compiler = tt_callable(self)
+        legacy_tt_callable = getattr(self, "type_compiler", None)
+        if legacy_tt_callable is not None:
+            tt_callable = cast(
+                Type[compiler.GenericTypeCompiler],
+                self.type_compiler,
+            )
+        else:
+            tt_callable = self.type_compiler_cls
+
+        self.type_compiler_instance = self.type_compiler = tt_callable(self)
+
         if supports_native_boolean is not None:
             self.supports_native_boolean = supports_native_boolean
 
@@ -314,6 +329,27 @@ class DefaultDialect(Dialect):
             )
         self.label_length = label_length
         self.compiler_linting = compiler_linting
+
+    @util.deprecated_property(
+        "2.0",
+        "full_returning is deprecated, please use insert_returning, "
+        "update_returning, delete_returning",
+    )
+    def full_returning(self):
+        return (
+            self.insert_returning
+            and self.update_returning
+            and self.delete_returning
+        )
+
+    @util.memoized_property
+    def loaded_dbapi(self) -> ModuleType:
+        if self.dbapi is None:
+            raise exc.InvalidRequestError(
+                f"Dialect {self} does not have a Python DBAPI established "
+                "and cannot be used for actual database interaction"
+            )
+        return self.dbapi
 
     @util.memoized_property
     def _bind_typing_render_casts(self):
@@ -475,16 +511,23 @@ class DefaultDialect(Dialect):
         and passes on to :func:`_types.adapt_type`.
 
         """
-        return sqltypes.adapt_type(typeobj, self.colspecs)
+        return type_api.adapt_type(typeobj, self.colspecs)
 
-    def has_index(self, connection, table_name, index_name, schema=None):
-        if not self.has_table(connection, table_name, schema=schema):
+    def has_index(self, connection, table_name, index_name, schema=None, **kw):
+        if not self.has_table(connection, table_name, schema=schema, **kw):
             return False
-        for idx in self.get_indexes(connection, table_name, schema=schema):
+        for idx in self.get_indexes(
+            connection, table_name, schema=schema, **kw
+        ):
             if idx["name"] == index_name:
                 return True
         else:
             return False
+
+    def has_schema(
+        self, connection: Connection, schema_name: str, **kw: Any
+    ) -> bool:
+        return schema_name in self.get_schema_names(connection, **kw)
 
     def validate_identifier(self, ident):
         if len(ident) > self.max_identifier_length:
@@ -495,7 +538,7 @@ class DefaultDialect(Dialect):
 
     def connect(self, *cargs, **cparams):
         # inherits the docstring from interfaces.Dialect.connect
-        return self.dbapi.connect(*cargs, **cparams)
+        return self.loaded_dbapi.connect(*cargs, **cparams)
 
     def create_connect_args(self, url):
         # inherits the docstring from interfaces.Dialect.create_connect_args
@@ -584,7 +627,7 @@ class DefaultDialect(Dialect):
     def _dialect_specific_select_one(self):
         return str(expression.select(1).compile(dialect=self))
 
-    def do_ping(self, dbapi_connection):
+    def do_ping(self, dbapi_connection: DBAPIConnection) -> bool:
         cursor = None
         try:
             cursor = dbapi_connection.cursor()
@@ -592,8 +635,24 @@ class DefaultDialect(Dialect):
                 cursor.execute(self._dialect_specific_select_one)
             finally:
                 cursor.close()
-        except self.dbapi.Error as err:
-            if self.is_disconnect(err, dbapi_connection, cursor):
+        except self.loaded_dbapi.Error as err:
+            is_disconnect = self.is_disconnect(err, dbapi_connection, cursor)
+
+            if self._has_events:
+                try:
+                    Connection._handle_dbapi_exception_noconnection(
+                        err,
+                        self,
+                        is_disconnect=is_disconnect,
+                        invalidate_pool_on_disconnect=False,
+                    )
+                except exc.StatementError as new_err:
+                    is_disconnect = new_err.connection_invalidated
+
+                # other exceptions modified by the event handler will be
+                # thrown
+
+            if is_disconnect:
                 return False
             else:
                 raise
@@ -607,7 +666,7 @@ class DefaultDialect(Dialect):
         do_commit_twophase().  Its format is unspecified.
         """
 
-        return "_sa_%032x" % random.randint(0, 2 ** 128)
+        return "_sa_%032x" % random.randint(0, 2**128)
 
     def do_savepoint(self, connection, name):
         connection.execute(expression.SavepointClause(name))
@@ -722,33 +781,133 @@ class DefaultDialect(Dialect):
     def get_driver_connection(self, connection):
         return connection
 
+    def _overrides_default(self, method):
+        return (
+            getattr(type(self), method).__code__
+            is not getattr(DefaultDialect, method).__code__
+        )
 
-class _RendersLiteral:
-    def literal_processor(self, dialect):
-        def process(value):
-            return "'%s'" % value
+    def _default_multi_reflect(
+        self,
+        single_tbl_method,
+        connection,
+        kind,
+        schema,
+        filter_names,
+        scope,
+        **kw,
+    ):
 
-        return process
+        names_fns = []
+        temp_names_fns = []
+        if ObjectKind.TABLE in kind:
+            names_fns.append(self.get_table_names)
+            temp_names_fns.append(self.get_temp_table_names)
+        if ObjectKind.VIEW in kind:
+            names_fns.append(self.get_view_names)
+            temp_names_fns.append(self.get_temp_view_names)
+        if ObjectKind.MATERIALIZED_VIEW in kind:
+            names_fns.append(self.get_materialized_view_names)
+            # no temp materialized view at the moment
+            # temp_names_fns.append(self.get_temp_materialized_view_names)
 
+        unreflectable = kw.pop("unreflectable", {})
 
-class _StrDateTime(_RendersLiteral, sqltypes.DateTime):
-    pass
+        if (
+            filter_names
+            and scope is ObjectScope.ANY
+            and kind is ObjectKind.ANY
+        ):
+            # if names are given and no qualification on type of table
+            # (i.e. the Table(..., autoload) case), take the names as given,
+            # don't run names queries. If a table does not exit
+            # NoSuchTableError is raised and it's skipped
 
+            # this also suits the case for mssql where we can reflect
+            # individual temp tables but there's no temp_names_fn
+            names = filter_names
+        else:
+            names = []
+            name_kw = {"schema": schema, **kw}
+            fns = []
+            if ObjectScope.DEFAULT in scope:
+                fns.extend(names_fns)
+            if ObjectScope.TEMPORARY in scope:
+                fns.extend(temp_names_fns)
 
-class _StrDate(_RendersLiteral, sqltypes.Date):
-    pass
+            for fn in fns:
+                try:
+                    names.extend(fn(connection, **name_kw))
+                except NotImplementedError:
+                    pass
 
+        if filter_names:
+            filter_names = set(filter_names)
 
-class _StrTime(_RendersLiteral, sqltypes.Time):
-    pass
+        # iterate over all the tables/views and call the single table method
+        for table in names:
+            if not filter_names or table in filter_names:
+                key = (schema, table)
+                try:
+                    yield (
+                        key,
+                        single_tbl_method(
+                            connection, table, schema=schema, **kw
+                        ),
+                    )
+                except exc.UnreflectableTableError as err:
+                    if key not in unreflectable:
+                        unreflectable[key] = err
+                except exc.NoSuchTableError:
+                    pass
+
+    def get_multi_table_options(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_table_options, connection, **kw
+        )
+
+    def get_multi_columns(self, connection, **kw):
+        return self._default_multi_reflect(self.get_columns, connection, **kw)
+
+    def get_multi_pk_constraint(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_pk_constraint, connection, **kw
+        )
+
+    def get_multi_foreign_keys(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_foreign_keys, connection, **kw
+        )
+
+    def get_multi_indexes(self, connection, **kw):
+        return self._default_multi_reflect(self.get_indexes, connection, **kw)
+
+    def get_multi_unique_constraints(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_unique_constraints, connection, **kw
+        )
+
+    def get_multi_check_constraints(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_check_constraints, connection, **kw
+        )
+
+    def get_multi_table_comment(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_table_comment, connection, **kw
+        )
 
 
 class StrCompileDialect(DefaultDialect):
 
     statement_compiler = compiler.StrSQLCompiler
     ddl_compiler = compiler.DDLCompiler
-    type_compiler = compiler.StrSQLTypeCompiler  # type: ignore
+    type_compiler_cls = compiler.StrSQLTypeCompiler
     preparer = compiler.IdentifierPreparer
+
+    insert_returning = True
+    update_returning = True
+    delete_returning = True
 
     supports_statement_cache = True
 
@@ -757,18 +916,11 @@ class StrCompileDialect(DefaultDialect):
     supports_sequences = True
     sequences_optional = True
     preexecute_autoincrement_sequences = False
-    implicit_returning = False
 
     supports_native_boolean = True
 
     supports_multivalues_insert = True
     supports_simple_order_by_label = True
-
-    colspecs = {
-        sqltypes.DateTime: _StrDateTime,
-        sqltypes.Date: _StrDate,
-        sqltypes.Time: _StrTime,
-    }
 
 
 class DefaultExecutionContext(ExecutionContext):
@@ -784,7 +936,7 @@ class DefaultExecutionContext(ExecutionContext):
     result_column_struct: Optional[
         Tuple[List[ResultColumnsEntry], bool, bool, bool]
     ] = None
-    returned_default_rows: Optional[List[Row]] = None
+    returned_default_rows: Optional[Sequence[Row[Any]]] = None
 
     execution_options: _ExecuteOptions = util.EMPTY_DICT
 
@@ -797,6 +949,8 @@ class DefaultExecutionContext(ExecutionContext):
     _is_server_side = False
 
     _soft_closed = False
+
+    _has_rowcount = False
 
     # a hook for SQLite's translation of
     # result column names
@@ -832,7 +986,8 @@ class DefaultExecutionContext(ExecutionContext):
         execution_options: _ExecuteOptions,
         compiled_ddl: DDLCompiler,
     ) -> ExecutionContext:
-        """Initialize execution context for a DDLElement construct."""
+        """Initialize execution context for an ExecutableDDLElement
+        construct."""
 
         self = cls.__new__(cls)
         self.root_connection = connection
@@ -906,22 +1061,29 @@ class DefaultExecutionContext(ExecutionContext):
         self.is_text = compiled.isplaintext
 
         if self.isinsert or self.isupdate or self.isdelete:
+            if TYPE_CHECKING:
+                assert isinstance(compiled.statement, UpdateBase)
             self.is_crud = True
             self._is_explicit_returning = bool(compiled.statement._returning)
-            self._is_implicit_returning = bool(
-                compiled.returning and not compiled.statement._returning
+            self._is_implicit_returning = is_implicit_returning = bool(
+                compiled.implicit_returning
+            )
+            assert not (
+                is_implicit_returning and compiled.statement._returning
             )
 
         if not parameters:
             self.compiled_parameters = [
                 compiled.construct_params(
-                    extracted_parameters=extracted_parameters
+                    extracted_parameters=extracted_parameters,
+                    escape_names=False,
                 )
             ]
         else:
             self.compiled_parameters = [
                 compiled.construct_params(
                     m,
+                    escape_names=False,
                     _group_number=grp,
                     extracted_parameters=extracted_parameters,
                 )
@@ -943,7 +1105,7 @@ class DefaultExecutionContext(ExecutionContext):
         processors = compiled._bind_processors
 
         flattened_processors: Mapping[
-            str, _ProcessorType
+            str, _BindProcessorType[Any]
         ] = processors  # type: ignore[assignment]
 
         if compiled.literal_execute_params or compiled.post_compile_params:
@@ -1004,14 +1166,31 @@ class DefaultExecutionContext(ExecutionContext):
             self.parameters = core_positional_parameters
         else:
             core_dict_parameters: MutableSequence[Dict[str, Any]] = []
-            for compiled_params in self.compiled_parameters:
+            escaped_names = compiled.escaped_bind_names
 
-                d_param: Dict[str, Any] = {
-                    key: flattened_processors[key](compiled_params[key])
-                    if key in flattened_processors
-                    else compiled_params[key]
-                    for key in compiled_params
-                }
+            # note that currently, "expanded" parameters will be present
+            # in self.compiled_parameters in their quoted form.   This is
+            # slightly inconsistent with the approach taken as of
+            # #8056 where self.compiled_parameters is meant to contain unquoted
+            # param names.
+            d_param: Dict[str, Any]
+            for compiled_params in self.compiled_parameters:
+                if escaped_names:
+                    d_param = {
+                        escaped_names.get(key, key): flattened_processors[key](
+                            compiled_params[key]
+                        )
+                        if key in flattened_processors
+                        else compiled_params[key]
+                        for key in compiled_params
+                    }
+                else:
+                    d_param = {
+                        key: flattened_processors[key](compiled_params[key])
+                        if key in flattened_processors
+                        else compiled_params[key]
+                        for key in compiled_params
+                    }
 
                 core_dict_parameters.append(d_param)
 
@@ -1139,12 +1318,6 @@ class DefaultExecutionContext(ExecutionContext):
             return self.compiled.update_prefetch
         else:
             return ()
-
-    @util.memoized_property
-    def returning_cols(self) -> Optional[Sequence[Column[Any]]]:
-        if TYPE_CHECKING:
-            assert isinstance(self.compiled, SQLCompiler)
-        return self.compiled.returning
 
     @util.memoized_property
     def no_parameters(self):
@@ -1295,8 +1468,8 @@ class DefaultExecutionContext(ExecutionContext):
     def handle_dbapi_exception(self, e):
         pass
 
-    @property
-    def rowcount(self):
+    @util.non_memoized_property
+    def rowcount(self) -> int:
         return self.cursor.rowcount
 
     def supports_sane_rowcount(self):
@@ -1306,15 +1479,20 @@ class DefaultExecutionContext(ExecutionContext):
         return self.dialect.supports_sane_multi_rowcount
 
     def _setup_result_proxy(self):
+        exec_opt = self.execution_options
+
         if self.is_crud or self.is_text:
             result = self._setup_dml_or_text_result()
+            yp = sr = False
         else:
+            yp = exec_opt.get("yield_per", None)
+            sr = self._is_server_side or exec_opt.get("stream_results", False)
             strategy = self.cursor_fetch_strategy
-            if self._is_server_side and strategy is _cursor._DEFAULT_FETCH:
+            if sr and strategy is _cursor._DEFAULT_FETCH:
                 strategy = _cursor.BufferedRowCursorFetchStrategy(
                     self.cursor, self.execution_options
                 )
-            cursor_description = (
+            cursor_description: _DBAPICursorDescription = (
                 strategy.alternate_cursor_description
                 or self.cursor.description
             )
@@ -1324,6 +1502,7 @@ class DefaultExecutionContext(ExecutionContext):
             result = _cursor.CursorResult(self, strategy, cursor_description)
 
         compiled = self.compiled
+
         if (
             compiled
             and not self.isddl
@@ -1332,6 +1511,9 @@ class DefaultExecutionContext(ExecutionContext):
             self._setup_out_parameters(result)
 
         self._soft_closed = result._soft_closed
+
+        if yp:
+            result = result.yield_per(yp)
 
         return result
 
@@ -1354,7 +1536,7 @@ class DefaultExecutionContext(ExecutionContext):
 
             type_ = bindparam.type
             impl_type = type_.dialect_impl(self.dialect)
-            dbapi_type = impl_type.get_dbapi_type(self.dialect.dbapi)
+            dbapi_type = impl_type.get_dbapi_type(self.dialect.loaded_dbapi)
             result_processor = impl_type.result_processor(
                 self.dialect, dbapi_type
             )
@@ -1387,7 +1569,9 @@ class DefaultExecutionContext(ExecutionContext):
         if cursor_description is None:
             strategy = _cursor._NO_CURSOR_DML
 
-        result = _cursor.CursorResult(self, strategy, cursor_description)
+        result: _cursor.CursorResult[Any] = _cursor.CursorResult(
+            self, strategy, cursor_description
+        )
 
         if self.isinsert:
             if self._is_implicit_returning:
@@ -1422,6 +1606,7 @@ class DefaultExecutionContext(ExecutionContext):
             # is testing this, and psycopg will no longer return
             # rowcount after cursor is closed.
             result.rowcount
+            self._has_rowcount = True
 
             row = result.fetchone()
             if row is not None:
@@ -1437,7 +1622,12 @@ class DefaultExecutionContext(ExecutionContext):
             # no results, get rowcount
             # (which requires open cursor on some drivers)
             result.rowcount
+            self._has_rowcount = True
             result._soft_close()
+        elif self.isupdate or self.isdelete:
+            result.rowcount
+            self._has_rowcount = True
+
         return result
 
     @util.memoized_property
@@ -1451,7 +1641,6 @@ class DefaultExecutionContext(ExecutionContext):
         getter = cast(
             SQLCompiler, self.compiled
         )._inserted_primary_key_from_lastrowid_getter
-
         lastrowid = self.get_lastrowid()
         return [getter(lastrowid, self.compiled_parameters[0])]
 
@@ -1755,15 +1944,11 @@ class DefaultExecutionContext(ExecutionContext):
         # to avoid many calls of get_insert_default()/
         # get_update_default()
         for c in insert_prefetch:
-            if c.default and not c.default.is_sequence and c.default.is_scalar:
-                if TYPE_CHECKING:
-                    assert isinstance(c.default, ColumnDefault)
+            if c.default and default_is_scalar(c.default):
                 scalar_defaults[c] = c.default.arg
 
         for c in update_prefetch:
-            if c.onupdate and c.onupdate.is_scalar:
-                if TYPE_CHECKING:
-                    assert isinstance(c.onupdate, ColumnDefault)
+            if c.onupdate and default_is_scalar(c.onupdate):
                 scalar_defaults[c] = c.onupdate.arg
 
         for param in self.compiled_parameters:
@@ -1794,9 +1979,7 @@ class DefaultExecutionContext(ExecutionContext):
         ) = self.compiled_parameters[0]
 
         for c in compiled.insert_prefetch:
-            if c.default and not c.default.is_sequence and c.default.is_scalar:
-                if TYPE_CHECKING:
-                    assert isinstance(c.default, ColumnDefault)
+            if c.default and default_is_scalar(c.default):
                 val = c.default.arg
             else:
                 val = self.get_insert_default(c)

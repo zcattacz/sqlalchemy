@@ -4,6 +4,8 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: ignore-errors
+
 r"""
 .. dialect:: postgresql+psycopg2
     :name: psycopg2
@@ -105,7 +107,7 @@ using ``host`` as an additional keyword argument::
 .. seealso::
 
     `PQconnectdbParams \
-    <https://www.postgresql.org/docs/9.1/static/libpq-connect.html#LIBPQ-PQCONNECTDBPARAMS>`_
+    <https://www.postgresql.org/docs/current/static/libpq-connect.html#LIBPQ-PQCONNECTDBPARAMS>`_
 
 .. _psycopg2_multi_host:
 
@@ -115,22 +117,51 @@ Specifying multiple fallback hosts
 psycopg2 supports multiple connection points in the connection string.
 When the ``host`` parameter is used multiple times in the query section of
 the URL, SQLAlchemy will create a single string of the host and port
-information provided to make the connections::
+information provided to make the connections.  Tokens may consist of
+``host::port`` or just ``host``; in the latter case, the default port
+is selected by libpq.  In the example below, three host connections
+are specified, for ``HostA::PortA``, ``HostB`` connecting to the default port,
+and ``HostC::PortC``::
 
     create_engine(
-        "postgresql+psycopg2://user:password@/dbname?host=HostA:port1&host=HostB&host=HostC"
+        "postgresql+psycopg2://user:password@/dbname?host=HostA:PortA&host=HostB&host=HostC:PortC"
     )
 
-A connection to each host is then attempted until either a connection is successful
-or all connections are unsuccessful in which case an error is raised.
+As an alternative, libpq query string format also may be used; this specifies
+``host`` and ``port`` as single query string arguments with comma-separated
+lists - the default port can be chosen by indicating an empty value
+in the comma separated list::
+
+    create_engine(
+        "postgresql+psycopg2://user:password@/dbname?host=HostA,HostB,HostC&port=PortA,,PortC"
+    )
+
+With either URL style, connections to each host is attempted based on a
+configurable strategy, which may be configured using the libpq
+``target_session_attrs`` parameter.  Per libpq this defaults to ``any``
+which indicates a connection to each host is then attempted until a connection is successful.
+Other strategies include ``primary``, ``prefer-standby``, etc.  The complete
+list is documented by PostgreSQL at
+`libpq connection strings <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING>`_.
+
+For example, to indicate two hosts using the ``primary`` strategy::
+
+    create_engine(
+        "postgresql+psycopg2://user:password@/dbname?host=HostA:PortA&host=HostB&host=HostC:PortC&target_session_attrs=primary"
+    )
+
+.. versionchanged:: 1.4.40 Port specification in psycopg2 multiple host format
+   is repaired, previously ports were not correctly interpreted in this context.
+   libpq comma-separated format is also now supported.
 
 .. versionadded:: 1.3.20 Support for multiple hosts in PostgreSQL connection
    string.
 
 .. seealso::
 
-    `PQConnString \
-    <https://www.postgresql.org/docs/10/libpq-connect.html#LIBPQ-CONNSTRING>`_
+    `libpq connection strings <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING>`_ - please refer
+    to this section in the libpq documentation for complete background on multiple host support.
+
 
 Empty DSN Connections / Environment Variable Connections
 ---------------------------------------------------------
@@ -203,7 +234,7 @@ performance, primarily with INSERT statements, by multiple orders of magnitude.
 SQLAlchemy internally makes use of these extensions for ``executemany()`` style
 calls, which correspond to lists of parameters being passed to
 :meth:`_engine.Connection.execute` as detailed in :ref:`multiple parameter
-sets <execute_multiple>`.   The ORM also uses this mode internally whenever
+sets <tutorial_multiple_parameters>`.   The ORM also uses this mode internally whenever
 possible.
 
 The two available extensions on the psycopg2 side are the ``execute_values()``
@@ -279,7 +310,7 @@ size defaults to 100.  These can be affected by passing new values to
 
 .. seealso::
 
-    :ref:`execute_multiple` - General information on using the
+    :ref:`tutorial_multiple_parameters` - General information on using the
     :class:`_engine.Connection`
     object to execute statements in such a way as to make
     use of the DBAPI ``.executemany()`` method.
@@ -443,10 +474,14 @@ place within SQLAlchemy's own marshalling logic, and not that of ``psycopg2``
 which may be more performant.
 
 """  # noqa
+from __future__ import annotations
+
 import collections.abc as collections_abc
 import logging
 import re
+from typing import cast
 
+from . import ranges
 from ._psycopg_common import _PGDialect_common_psycopg
 from ._psycopg_common import _PGExecutionContext_common_psycopg
 from .base import PGCompiler
@@ -456,7 +491,8 @@ from .json import JSONB
 from ... import types as sqltypes
 from ... import util
 from ...engine import cursor as _cursor
-
+from ...util import FastIntFlag
+from ...util import parse_user_argument_for_enum
 
 logger = logging.getLogger("sqlalchemy.dialects.postgresql")
 
@@ -471,6 +507,56 @@ class _PGJSONB(JSONB):
         return None
 
 
+class _Psycopg2Range(ranges.AbstractRange):
+    _psycopg2_range_cls = "none"
+
+    def bind_processor(self, dialect):
+        Range = getattr(
+            cast(PGDialect_psycopg2, dialect)._psycopg2_extras,
+            self._psycopg2_range_cls,
+        )
+
+        NoneType = type(None)
+
+        def to_range(value):
+            if not isinstance(value, (str, NoneType)):
+                value = Range(
+                    value.lower, value.upper, value.bounds, value.empty
+                )
+            return value
+
+        return to_range
+
+    def result_processor(self, dialect, coltype):
+        def to_range(value):
+            if value is not None:
+                value = ranges.Range(
+                    value._lower,
+                    value._upper,
+                    bounds=value._bounds if value._bounds else "[)",
+                    empty=not value._bounds,
+                )
+            return value
+
+        return to_range
+
+
+class _Psycopg2NumericRange(_Psycopg2Range):
+    _psycopg2_range_cls = "NumericRange"
+
+
+class _Psycopg2DateRange(_Psycopg2Range):
+    _psycopg2_range_cls = "DateRange"
+
+
+class _Psycopg2DateTimeRange(_Psycopg2Range):
+    _psycopg2_range_cls = "DateTimeRange"
+
+
+class _Psycopg2DateTimeTZRange(_Psycopg2Range):
+    _psycopg2_range_cls = "DateTimeTZRange"
+
+
 class PGExecutionContext_psycopg2(_PGExecutionContext_common_psycopg):
     _psycopg2_fetched_rows = None
 
@@ -478,7 +564,7 @@ class PGExecutionContext_psycopg2(_PGExecutionContext_common_psycopg):
         if (
             self._psycopg2_fetched_rows
             and self.compiled
-            and self.compiled.returning
+            and self.compiled.effective_returning
         ):
             # psycopg2 execute_values will provide for a real cursor where
             # cursor.description works correctly. however, it executes the
@@ -519,13 +605,19 @@ class PGIdentifierPreparer_psycopg2(PGIdentifierPreparer):
     pass
 
 
-EXECUTEMANY_PLAIN = util.symbol("executemany_plain", canonical=0)
-EXECUTEMANY_BATCH = util.symbol("executemany_batch", canonical=1)
-EXECUTEMANY_VALUES = util.symbol("executemany_values", canonical=2)
-EXECUTEMANY_VALUES_PLUS_BATCH = util.symbol(
-    "executemany_values_plus_batch",
-    canonical=EXECUTEMANY_BATCH | EXECUTEMANY_VALUES,
-)
+class ExecutemanyMode(FastIntFlag):
+    EXECUTEMANY_PLAIN = 0
+    EXECUTEMANY_BATCH = 1
+    EXECUTEMANY_VALUES = 2
+    EXECUTEMANY_VALUES_PLUS_BATCH = EXECUTEMANY_BATCH | EXECUTEMANY_VALUES
+
+
+(
+    EXECUTEMANY_PLAIN,
+    EXECUTEMANY_BATCH,
+    EXECUTEMANY_VALUES,
+    EXECUTEMANY_VALUES_PLUS_BATCH,
+) = tuple(ExecutemanyMode)
 
 
 class PGDialect_psycopg2(_PGDialect_common_psycopg):
@@ -550,6 +642,12 @@ class PGDialect_psycopg2(_PGDialect_common_psycopg):
             JSON: _PGJSON,
             sqltypes.JSON: _PGJSON,
             JSONB: _PGJSONB,
+            ranges.INT4RANGE: _Psycopg2NumericRange,
+            ranges.INT8RANGE: _Psycopg2NumericRange,
+            ranges.NUMRANGE: _Psycopg2NumericRange,
+            ranges.DATERANGE: _Psycopg2DateRange,
+            ranges.TSRANGE: _Psycopg2DateTimeRange,
+            ranges.TSTZRANGE: _Psycopg2DateTimeTZRange,
         },
     )
 
@@ -564,7 +662,7 @@ class PGDialect_psycopg2(_PGDialect_common_psycopg):
 
         # Parse executemany_mode argument, allowing it to be only one of the
         # symbol names
-        self.executemany_mode = util.symbol.parse_user_argument(
+        self.executemany_mode = parse_user_argument_for_enum(
             executemany_mode,
             {
                 EXECUTEMANY_PLAIN: [None],
@@ -603,7 +701,7 @@ class PGDialect_psycopg2(_PGDialect_common_psycopg):
 
         # PGDialect.initialize() checks server version for <= 8.2 and sets
         # this flag to False if so
-        if not self.full_returning:
+        if not self.insert_returning:
             self.insert_executemany_returning = False
             self.executemany_mode = EXECUTEMANY_PLAIN
 
@@ -666,7 +764,7 @@ class PGDialect_psycopg2(_PGDialect_common_psycopg):
 
             fns.append(on_connect)
 
-        if self.dbapi and self.use_native_uuid:
+        if self.dbapi:
 
             def on_connect(dbapi_conn):
                 extras.register_uuid(None, dbapi_conn)
@@ -712,7 +810,7 @@ class PGDialect_psycopg2(_PGDialect_common_psycopg):
             self.executemany_mode & EXECUTEMANY_VALUES
             and context
             and context.isinsert
-            and context.compiled.insert_single_values_expr
+            and context.compiled._is_safe_for_fast_insert_values_helper
         ):
             executemany_values = (
                 "(%s)" % context.compiled.insert_single_values_expr
@@ -736,7 +834,7 @@ class PGDialect_psycopg2(_PGDialect_common_psycopg):
                 statement,
                 parameters,
                 template=executemany_values,
-                fetch=bool(context.compiled.returning),
+                fetch=bool(context.compiled.effective_returning),
                 **kwargs,
             )
 

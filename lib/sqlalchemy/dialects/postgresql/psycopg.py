@@ -4,6 +4,8 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: ignore-errors
+
 r"""
 .. dialect:: postgresql+psycopg
     :name: psycopg (a.k.a. psycopg 3)
@@ -55,25 +57,31 @@ release of SQLAlchemy 2.0, however.
     Further documentation is available there.
 
 """  # noqa
+from __future__ import annotations
+
 import logging
 import re
+from typing import cast
+from typing import TYPE_CHECKING
 
+from . import ranges
 from ._psycopg_common import _PGDialect_common_psycopg
 from ._psycopg_common import _PGExecutionContext_common_psycopg
-from ._psycopg_common import _PsycopgUUID
 from .base import INTERVAL
 from .base import PGCompiler
 from .base import PGIdentifierPreparer
-from .base import UUID
 from .json import JSON
 from .json import JSONB
 from .json import JSONPathType
 from ... import pool
-from ... import types as sqltypes
 from ... import util
 from ...engine import AdaptedConnection
+from ...sql import sqltypes
 from ...util.concurrency import await_fallback
 from ...util.concurrency import await_only
+
+if TYPE_CHECKING:
+    from typing import Iterable
 
 logger = logging.getLogger("sqlalchemy.dialects.postgresql")
 
@@ -118,10 +126,6 @@ class _PGJSONPathType(JSONPathType):
     pass
 
 
-class _PGUUID(_PsycopgUUID):
-    render_bind_cast = True
-
-
 class _PGInterval(INTERVAL):
     render_bind_cast = True
 
@@ -158,6 +162,78 @@ class _PGBoolean(sqltypes.Boolean):
     render_bind_cast = True
 
 
+class _PsycopgRange(ranges.AbstractRange):
+    def bind_processor(self, dialect):
+        Range = cast(PGDialect_psycopg, dialect)._psycopg_Range
+
+        NoneType = type(None)
+
+        def to_range(value):
+            if not isinstance(value, (str, NoneType)):
+                value = Range(
+                    value.lower, value.upper, value.bounds, value.empty
+                )
+            return value
+
+        return to_range
+
+    def result_processor(self, dialect, coltype):
+        def to_range(value):
+            if value is not None:
+                value = ranges.Range(
+                    value._lower,
+                    value._upper,
+                    bounds=value._bounds if value._bounds else "[)",
+                    empty=not value._bounds,
+                )
+            return value
+
+        return to_range
+
+
+class _PsycopgMultiRange(ranges.AbstractMultiRange):
+    def bind_processor(self, dialect):
+        Range = cast(PGDialect_psycopg, dialect)._psycopg_Range
+        Multirange = cast(PGDialect_psycopg, dialect)._psycopg_Multirange
+
+        NoneType = type(None)
+
+        def to_range(value):
+            if isinstance(value, (str, NoneType)):
+                return value
+
+            return Multirange(
+                [
+                    Range(
+                        element.lower,
+                        element.upper,
+                        element.bounds,
+                        element.empty,
+                    )
+                    for element in cast("Iterable[ranges.Range]", value)
+                ]
+            )
+
+        return to_range
+
+    def result_processor(self, dialect, coltype):
+        def to_range(value):
+            if value is not None:
+                value = [
+                    ranges.Range(
+                        elem._lower,
+                        elem._upper,
+                        bounds=elem._bounds if elem._bounds else "[)",
+                        empty=not elem._bounds,
+                    )
+                    for elem in value
+                ]
+
+            return value
+
+        return to_range
+
+
 class PGExecutionContext_psycopg(_PGExecutionContext_common_psycopg):
     pass
 
@@ -188,6 +264,7 @@ class PGDialect_psycopg(_PGDialect_common_psycopg):
     psycopg_version = (0, 0)
 
     _has_native_hstore = True
+    _psycopg_adapters_map = None
 
     colspecs = util.update_copy(
         _PGDialect_common_psycopg.colspecs,
@@ -199,7 +276,6 @@ class PGDialect_psycopg(_PGDialect_common_psycopg):
             sqltypes.JSON.JSONPathType: _PGJSONPathType,
             sqltypes.JSON.JSONIntIndexType: _PGJSONIntIndexType,
             sqltypes.JSON.JSONStrIndexType: _PGJSONStrIndexType,
-            UUID: _PGUUID,
             sqltypes.Interval: _PGInterval,
             INTERVAL: _PGInterval,
             sqltypes.Date: _PGDate,
@@ -208,6 +284,8 @@ class PGDialect_psycopg(_PGDialect_common_psycopg):
             sqltypes.Integer: _PGInteger,
             sqltypes.SmallInteger: _PGSmallInteger,
             sqltypes.BigInteger: _PGBigInteger,
+            ranges.AbstractRange: _PsycopgRange,
+            ranges.AbstractMultiRange: _PsycopgMultiRange,
         },
     )
 
@@ -246,7 +324,8 @@ class PGDialect_psycopg(_PGDialect_common_psycopg):
         # see https://github.com/psycopg/psycopg/issues/83
         cargs, cparams = super().create_connect_args(url)
 
-        cparams["context"] = self._psycopg_adapters_map
+        if self._psycopg_adapters_map:
+            cparams["context"] = self._psycopg_adapters_map
         if self.client_encoding is not None:
             cparams["client_encoding"] = self.client_encoding
         return cargs, cparams
@@ -261,7 +340,7 @@ class PGDialect_psycopg(_PGDialect_common_psycopg):
 
         # PGDialect.initialize() checks server version for <= 8.2 and sets
         # this flag to False if so
-        if not self.full_returning:
+        if not self.insert_returning:
             self.insert_executemany_returning = False
 
         # HSTORE can't be registered until we have a connection so that
@@ -316,6 +395,18 @@ class PGDialect_psycopg(_PGDialect_common_psycopg):
         from psycopg.pq import TransactionStatus
 
         return TransactionStatus
+
+    @util.memoized_property
+    def _psycopg_Range(self):
+        from psycopg.types.range import Range
+
+        return Range
+
+    @util.memoized_property
+    def _psycopg_Multirange(self):
+        from psycopg.types.multirange import Multirange
+
+        return Multirange
 
     def _do_isolation_level(self, connection, autocommit, isolation_level):
         connection.autocommit = autocommit
@@ -385,12 +476,14 @@ class PGDialect_psycopg(_PGDialect_common_psycopg):
             != self._psycopg_TransactionStatus.IDLE
         ):
             dbapi_conn.rollback()
-        before = dbapi_conn.autocommit
+        before_autocommit = dbapi_conn.autocommit
         try:
-            self._do_autocommit(dbapi_conn, True)
+            if not before_autocommit:
+                self._do_autocommit(dbapi_conn, True)
             dbapi_conn.execute(command)
         finally:
-            self._do_autocommit(dbapi_conn, before)
+            if not before_autocommit:
+                self._do_autocommit(dbapi_conn, before_autocommit)
 
     def do_rollback_twophase(
         self, connection, xid, is_prepared=True, recover=False

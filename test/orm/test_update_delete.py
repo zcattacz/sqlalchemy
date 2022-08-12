@@ -9,6 +9,7 @@ from sqlalchemy import func
 from sqlalchemy import insert
 from sqlalchemy import Integer
 from sqlalchemy import lambda_stmt
+from sqlalchemy import MetaData
 from sqlalchemy import or_
 from sqlalchemy import select
 from sqlalchemy import String
@@ -56,12 +57,28 @@ class UpdateDeleteTest(fixtures.MappedTest):
             Column("user_id", ForeignKey("users.id")),
         )
 
+        m = MetaData()
+        users_no_returning = Table(
+            "users",
+            m,
+            Column(
+                "id", Integer, primary_key=True, test_needs_autoincrement=True
+            ),
+            Column("name", String(32)),
+            Column("age_int", Integer),
+            implicit_returning=False,
+        )
+        cls.tables.users_no_returning = users_no_returning
+
     @classmethod
     def setup_classes(cls):
         class User(cls.Comparable):
             pass
 
         class Address(cls.Comparable):
+            pass
+
+        class UserNoReturning(cls.Comparable):
             pass
 
     @classmethod
@@ -95,6 +112,49 @@ class UpdateDeleteTest(fixtures.MappedTest):
             },
         )
         cls.mapper_registry.map_imperatively(Address, addresses)
+
+        UserNoReturning = cls.classes.UserNoReturning
+        users_no_returning = cls.tables.users_no_returning
+        cls.mapper_registry.map_imperatively(
+            UserNoReturning,
+            users_no_returning,
+            properties={
+                "age": users_no_returning.c.age_int,
+            },
+        )
+
+    @testing.combinations("table", "mapper", "both", argnames="bind_type")
+    @testing.combinations(
+        "update", "insert", "delete", argnames="statement_type"
+    )
+    def test_get_bind_scenarios(self, connection, bind_type, statement_type):
+        """test for #7936"""
+
+        User = self.classes.User
+
+        if statement_type == "insert":
+            stmt = insert(User).values(
+                {User.id: 5, User.age: 25, User.name: "spongebob"}
+            )
+        elif statement_type == "update":
+            stmt = (
+                update(User)
+                .where(User.id == 2)
+                .values({User.name: "spongebob"})
+            )
+        elif statement_type == "delete":
+            stmt = delete(User)
+
+        binds = {}
+        if bind_type == "both":
+            binds = {User: connection, User.__table__: connection}
+        elif bind_type == "mapper":
+            binds = {User: connection}
+        elif bind_type == "table":
+            binds = {User.__table__: connection}
+
+        with Session(binds=binds) as sess:
+            sess.execute(stmt)
 
     def test_illegal_eval(self):
         User = self.classes.User
@@ -412,7 +472,7 @@ class UpdateDeleteTest(fixtures.MappedTest):
                 {"age": User.age + 10}, synchronize_session="fetch"
             )
 
-        if testing.db.dialect.full_returning:
+        if testing.db.dialect.update_returning:
             asserter.assert_(
                 CompiledSQL(
                     "UPDATE users SET age_int=(users.age_int + %(age_int_1)s) "
@@ -824,8 +884,12 @@ class UpdateDeleteTest(fixtures.MappedTest):
             list(zip([25, 37, 29, 27])),
         )
 
-    def test_update_fetch_returning(self):
-        User = self.classes.User
+    @testing.combinations(True, False, argnames="implicit_returning")
+    def test_update_fetch_returning(self, implicit_returning):
+        if implicit_returning:
+            User = self.classes.User
+        else:
+            User = self.classes.UserNoReturning
 
         sess = fixture_session()
 
@@ -840,7 +904,7 @@ class UpdateDeleteTest(fixtures.MappedTest):
             # the "fetch" strategy, new in 1.4, so there is no expiry
             eq_([john.age, jack.age, jill.age, jane.age], [25, 37, 29, 27])
 
-        if testing.db.dialect.full_returning:
+        if implicit_returning and testing.db.dialect.update_returning:
             asserter.assert_(
                 CompiledSQL(
                     "UPDATE users SET age_int=(users.age_int - %(age_int_1)s) "
@@ -886,7 +950,7 @@ class UpdateDeleteTest(fixtures.MappedTest):
             # the "fetch" strategy, new in 1.4, so there is no expiry
             eq_([john.age, jack.age, jill.age, jane.age], [25, 37, 29, 27])
 
-        if testing.db.dialect.full_returning:
+        if testing.db.dialect.update_returning:
             asserter.assert_(
                 CompiledSQL(
                     "UPDATE users SET age_int=(users.age_int - %(age_int_1)s) "
@@ -909,7 +973,7 @@ class UpdateDeleteTest(fixtures.MappedTest):
                 ),
             )
 
-    @testing.requires.full_returning
+    @testing.requires.update_returning
     def test_update_explicit_returning(self):
         User = self.classes.User
 
@@ -941,7 +1005,7 @@ class UpdateDeleteTest(fixtures.MappedTest):
             ),
         )
 
-    @testing.requires.full_returning
+    @testing.requires.update_returning
     def test_no_fetch_w_explicit_returning(self):
         User = self.classes.User
 
@@ -961,8 +1025,12 @@ class UpdateDeleteTest(fixtures.MappedTest):
         ):
             sess.execute(stmt)
 
-    def test_delete_fetch_returning(self):
-        User = self.classes.User
+    @testing.combinations(True, False, argnames="implicit_returning")
+    def test_delete_fetch_returning(self, implicit_returning):
+        if implicit_returning:
+            User = self.classes.User
+        else:
+            User = self.classes.UserNoReturning
 
         sess = fixture_session()
 
@@ -976,7 +1044,7 @@ class UpdateDeleteTest(fixtures.MappedTest):
                 synchronize_session="fetch"
             )
 
-        if testing.db.dialect.full_returning:
+        if implicit_returning and testing.db.dialect.delete_returning:
             asserter.assert_(
                 CompiledSQL(
                     "DELETE FROM users WHERE users.age_int > %(age_int_1)s "
@@ -1021,7 +1089,7 @@ class UpdateDeleteTest(fixtures.MappedTest):
                 stmt, execution_options={"synchronize_session": "fetch"}
             )
 
-        if testing.db.dialect.full_returning:
+        if testing.db.dialect.delete_returning:
             asserter.assert_(
                 CompiledSQL(
                     "DELETE FROM users WHERE users.age_int > %(age_int_1)s "
@@ -1647,8 +1715,8 @@ class UpdateDeleteFromTest(fixtures.MappedTest):
             ),
         )
 
-    @testing.requires.delete_from
-    def test_delete_from_joined_subq_test(self):
+    @testing.requires.delete_using
+    def test_delete_using_joined_subq_test(self):
         Document = self.classes.Document
         s = fixture_session()
 
@@ -1890,6 +1958,11 @@ class InheritTest(fixtures.DeclarativeMappedTest):
             id = Column(Integer, ForeignKey("person.id"), primary_key=True)
             engineer_name = Column(String(50))
 
+        class Programmer(Engineer):
+            __tablename__ = "programmer"
+            id = Column(Integer, ForeignKey("engineer.id"), primary_key=True)
+            primary_language = Column(String(50))
+
         class Manager(Person):
             __tablename__ = "manager"
             id = Column(Integer, ForeignKey("person.id"), primary_key=True)
@@ -1897,10 +1970,11 @@ class InheritTest(fixtures.DeclarativeMappedTest):
 
     @classmethod
     def insert_data(cls, connection):
-        Engineer, Person, Manager = (
+        Engineer, Person, Manager, Programmer = (
             cls.classes.Engineer,
             cls.classes.Person,
             cls.classes.Manager,
+            cls.classes.Programmer,
         )
         s = Session(connection)
         s.add_all(
@@ -1909,11 +1983,14 @@ class InheritTest(fixtures.DeclarativeMappedTest):
                 Manager(name="m1", manager_name="m1"),
                 Engineer(name="e2", engineer_name="e2"),
                 Person(name="p1"),
+                Programmer(
+                    name="pp1", engineer_name="pp1", primary_language="python"
+                ),
             ]
         )
         s.commit()
 
-    @testing.only_on("mysql", "Multi table update")
+    @testing.only_on(["mysql", "mariadb"], "Multi table update")
     def test_update_from_join_no_problem(self):
         person = self.classes.Person.__table__
         engineer = self.classes.Engineer.__table__
@@ -1930,53 +2007,253 @@ class InheritTest(fixtures.DeclarativeMappedTest):
         eq_(obj.name, "updated")
         eq_(obj.engineer_name, "e2a")
 
-    def test_update_subtable_only(self):
+    @testing.combinations(None, "fetch", "evaluate")
+    def test_update_sub_table_only(self, synchronize_session):
         Engineer = self.classes.Engineer
         s = Session(testing.db)
-        s.query(Engineer).update({"engineer_name": "e5"})
+        s.query(Engineer).update(
+            {"engineer_name": "e5"}, synchronize_session=synchronize_session
+        )
 
-        eq_(s.query(Engineer.engineer_name).all(), [("e5",), ("e5",)])
+        eq_(s.query(Engineer.engineer_name).all(), [("e5",), ("e5",), ("e5",)])
+
+    @testing.combinations(None, "fetch", "evaluate")
+    def test_update_sub_sub_table_only(self, synchronize_session):
+        Programmer = self.classes.Programmer
+        s = Session(testing.db)
+        s.query(Programmer).update(
+            {"primary_language": "c++"},
+            synchronize_session=synchronize_session,
+        )
+
+        eq_(
+            s.query(Programmer.primary_language).all(),
+            [
+                ("c++",),
+            ],
+        )
 
     @testing.requires.update_from
-    def test_update_from(self):
+    @testing.combinations(None, "fetch", "fetch_w_hint", "evaluate")
+    def test_update_from(self, synchronize_session):
+        """test an UPDATE that uses multiple tables.
+
+        The limitation that MariaDB has with DELETE does not apply here
+        at the moment as MariaDB doesn't support UPDATE..RETURNING at all.
+        However, the logic from DELETE is still implemented in
+        persistence.py. If MariaDB adds UPDATE...RETURNING, or SQLite adds
+        UPDATE..FROM, etc., then it will be useful.
+
+        """
         Engineer = self.classes.Engineer
         Person = self.classes.Person
         s = Session(testing.db)
-        s.query(Engineer).filter(Engineer.id == Person.id).filter(
-            Person.name == "e2"
-        ).update({"engineer_name": "e5"})
 
-        eq_(
-            set(s.query(Person.name, Engineer.engineer_name)),
-            set([("e1", "e1"), ("e2", "e5")]),
+        # we don't have any backends with this combination right now.
+        db_has_hypothetical_limitation = (
+            testing.db.dialect.update_returning
+            and not testing.db.dialect.update_returning_multifrom
         )
 
-    @testing.requires.delete_from
-    def test_delete_from(self):
-        Engineer = self.classes.Engineer
-        Person = self.classes.Person
-        s = Session(testing.db)
-        s.query(Engineer).filter(Engineer.id == Person.id).filter(
-            Person.name == "e2"
-        ).delete()
+        e2 = s.query(Engineer).filter_by(name="e2").first()
+
+        with self.sql_execution_asserter() as asserter:
+            eq_(e2.engineer_name, "e2")
+            q = (
+                s.query(Engineer)
+                .filter(Engineer.id == Person.id)
+                .filter(Person.name == "e2")
+            )
+            if synchronize_session == "fetch_w_hint":
+                q.execution_options(is_update_from=True).update(
+                    {"engineer_name": "e5"},
+                    synchronize_session="fetch",
+                )
+            elif (
+                synchronize_session == "fetch"
+                and db_has_hypothetical_limitation
+            ):
+                with expect_raises_message(
+                    exc.CompileError,
+                    'Dialect ".*" does not support RETURNING with '
+                    "UPDATE..FROM;",
+                ):
+                    q.update(
+                        {"engineer_name": "e5"},
+                        synchronize_session=synchronize_session,
+                    )
+                return
+            else:
+                q.update(
+                    {"engineer_name": "e5"},
+                    synchronize_session=synchronize_session,
+                )
+
+            if synchronize_session is None:
+                eq_(e2.engineer_name, "e2")
+            else:
+                eq_(e2.engineer_name, "e5")
+
+        if synchronize_session in ("fetch", "fetch_w_hint") and (
+            db_has_hypothetical_limitation
+            or not testing.db.dialect.update_returning
+        ):
+            asserter.assert_(
+                CompiledSQL(
+                    "SELECT person.id FROM person INNER JOIN engineer "
+                    "ON person.id = engineer.id WHERE engineer.id = person.id "
+                    "AND person.name = %s",
+                    [{"name_1": "e2"}],
+                    dialect="mariadb",
+                ),
+                CompiledSQL(
+                    "UPDATE engineer, person SET engineer.engineer_name=%s "
+                    "WHERE engineer.id = person.id AND person.name = %s",
+                    [{"engineer_name": "e5", "name_1": "e2"}],
+                    dialect="mariadb",
+                ),
+            )
+        elif synchronize_session in ("fetch", "fetch_w_hint"):
+            asserter.assert_(
+                CompiledSQL(
+                    "UPDATE engineer SET engineer_name=%(engineer_name)s "
+                    "FROM person WHERE engineer.id = person.id "
+                    "AND person.name = %(name_1)s RETURNING engineer.id",
+                    [{"engineer_name": "e5", "name_1": "e2"}],
+                    dialect="postgresql",
+                ),
+            )
+        else:
+            asserter.assert_(
+                CompiledSQL(
+                    "UPDATE engineer SET engineer_name=%(engineer_name)s "
+                    "FROM person WHERE engineer.id = person.id "
+                    "AND person.name = %(name_1)s",
+                    [{"engineer_name": "e5", "name_1": "e2"}],
+                    dialect="postgresql",
+                ),
+            )
 
         eq_(
             set(s.query(Person.name, Engineer.engineer_name)),
-            set([("e1", "e1")]),
+            set([("e1", "e1"), ("e2", "e5"), ("pp1", "pp1")]),
         )
 
-    @testing.only_on("mysql", "Multi table update")
-    def test_update_from_multitable(self):
+    @testing.requires.delete_using
+    @testing.combinations(None, "fetch", "fetch_w_hint", "evaluate")
+    def test_delete_using(self, synchronize_session):
+        """test a DELETE that uses multiple tables.
+
+        due to a limitation in MariaDB, we have an up front "hint" that needs
+        to be passed for this backend if DELETE USING is to be used in
+        conjunction with "fetch" strategy, so that we know before compilation
+        that we won't be able to use RETURNING.
+
+        """
+
+        Engineer = self.classes.Engineer
+        Person = self.classes.Person
+        s = Session(testing.db)
+
+        db_has_mariadb_limitation = (
+            testing.db.dialect.delete_returning
+            and not testing.db.dialect.delete_returning_multifrom
+        )
+
+        e2 = s.query(Engineer).filter_by(name="e2").first()
+
+        with self.sql_execution_asserter() as asserter:
+
+            assert e2 in s
+
+            q = (
+                s.query(Engineer)
+                .filter(Engineer.id == Person.id)
+                .filter(Person.name == "e2")
+            )
+
+            if synchronize_session == "fetch_w_hint":
+                q.execution_options(is_delete_using=True).delete(
+                    synchronize_session="fetch"
+                )
+            elif synchronize_session == "fetch" and db_has_mariadb_limitation:
+                with expect_raises_message(
+                    exc.CompileError,
+                    'Dialect ".*" does not support RETURNING with '
+                    "DELETE..USING;",
+                ):
+                    q.delete(synchronize_session=synchronize_session)
+                return
+            else:
+                q.delete(synchronize_session=synchronize_session)
+
+            if synchronize_session is None:
+                assert e2 in s
+            else:
+                assert e2 not in s
+
+        if synchronize_session in ("fetch", "fetch_w_hint") and (
+            db_has_mariadb_limitation
+            or not testing.db.dialect.delete_returning
+        ):
+            asserter.assert_(
+                CompiledSQL(
+                    "SELECT person.id FROM person INNER JOIN engineer ON "
+                    "person.id = engineer.id WHERE engineer.id = person.id "
+                    "AND person.name = %s",
+                    [{"name_1": "e2"}],
+                    dialect="mariadb",
+                ),
+                CompiledSQL(
+                    "DELETE FROM engineer USING engineer, person WHERE "
+                    "engineer.id = person.id AND person.name = %s",
+                    [{"name_1": "e2"}],
+                    dialect="mariadb",
+                ),
+            )
+        elif synchronize_session in ("fetch", "fetch_w_hint"):
+            asserter.assert_(
+                CompiledSQL(
+                    "DELETE FROM engineer USING person WHERE "
+                    "engineer.id = person.id AND person.name = %(name_1)s "
+                    "RETURNING engineer.id",
+                    [{"name_1": "e2"}],
+                    dialect="postgresql",
+                ),
+            )
+        else:
+            asserter.assert_(
+                CompiledSQL(
+                    "DELETE FROM engineer USING person WHERE "
+                    "engineer.id = person.id AND person.name = %(name_1)s",
+                    [{"name_1": "e2"}],
+                    dialect="postgresql",
+                ),
+            )
+
+        # delete actually worked
+        eq_(
+            set(s.query(Person.name, Engineer.engineer_name)),
+            set([("pp1", "pp1"), ("e1", "e1")]),
+        )
+
+    @testing.only_on(["mysql", "mariadb"], "Multi table update")
+    @testing.requires.delete_using
+    @testing.combinations(None, "fetch", "evaluate")
+    def test_update_from_multitable(self, synchronize_session):
         Engineer = self.classes.Engineer
         Person = self.classes.Person
         s = Session(testing.db)
         s.query(Engineer).filter(Engineer.id == Person.id).filter(
             Person.name == "e2"
-        ).update({Person.name: "e22", Engineer.engineer_name: "e55"})
+        ).update(
+            {Person.name: "e22", Engineer.engineer_name: "e55"},
+            synchronize_session=synchronize_session,
+        )
 
         eq_(
             set(s.query(Person.name, Engineer.engineer_name)),
-            set([("e1", "e1"), ("e22", "e55")]),
+            set([("e1", "e1"), ("e22", "e55"), ("pp1", "pp1")]),
         )
 
 
@@ -2115,7 +2392,7 @@ class SingleTablePolymorphicTest(fixtures.DeclarativeMappedTest):
 
 class LoadFromReturningTest(fixtures.MappedTest):
     __backend__ = True
-    __requires__ = ("full_returning",)
+    __requires__ = ("insert_returning",)
 
     @classmethod
     def define_tables(cls, metadata):
@@ -2164,6 +2441,7 @@ class LoadFromReturningTest(fixtures.MappedTest):
             },
         )
 
+    @testing.requires.update_returning
     def test_load_from_update(self, connection):
         User = self.classes.User
 
@@ -2184,21 +2462,45 @@ class LoadFromReturningTest(fixtures.MappedTest):
                 [User(name="jack", age=52), User(name="jill", age=34)],
             )
 
-    def test_load_from_insert(self, connection):
+    @testing.combinations(
+        ("single",),
+        ("multiple", testing.requires.multivalues_inserts),
+        argnames="params",
+    )
+    def test_load_from_insert(self, connection, params):
         User = self.classes.User
 
-        stmt = (
-            insert(User)
-            .values({User.id: 5, User.age: 25, User.name: "spongebob"})
-            .returning(User)
-        )
+        if params == "multiple":
+            values = [
+                {User.id: 5, User.age: 25, User.name: "spongebob"},
+                {User.id: 6, User.age: 30, User.name: "patrick"},
+                {User.id: 7, User.age: 35, User.name: "squidward"},
+            ]
+        elif params == "single":
+            values = {User.id: 5, User.age: 25, User.name: "spongebob"}
+        else:
+            assert False
+
+        stmt = insert(User).values(values).returning(User)
 
         stmt = select(User).from_statement(stmt)
 
         with Session(connection) as sess:
             rows = sess.execute(stmt).scalars().all()
 
-            eq_(
-                rows,
-                [User(name="spongebob", age=25)],
-            )
+            if params == "multiple":
+                eq_(
+                    rows,
+                    [
+                        User(name="spongebob", age=25),
+                        User(name="patrick", age=30),
+                        User(name="squidward", age=35),
+                    ],
+                )
+            elif params == "single":
+                eq_(
+                    rows,
+                    [User(name="spongebob", age=25)],
+                )
+            else:
+                assert False

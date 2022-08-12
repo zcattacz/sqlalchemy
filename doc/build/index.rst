@@ -53,6 +53,7 @@ SQLAlchemy Documentation
   .. container::
 
     * :doc:`Migrating to SQLAlchemy 2.0 <changelog/migration_20>` - Complete background on migrating from 1.3 or 1.4 to 2.0
+    * :doc:`What's New in SQLAlchemy 2.0? <changelog/whatsnew_20>` - New 2.0 features and behaviors beyond the 1.x migration
     * :doc:`Changelog catalog <changelog/index>` - Detailed changelogs for all SQLAlchemy Versions
 
 
@@ -70,7 +71,7 @@ SQLAlchemy Documentation
     **SQLAlchemy ORM**
 
     * **ORM Configuration:**
-      :doc:`Mapper Configuration <orm/mapper_config>` |
+      :doc:`Mapped Class Configuration <orm/mapper_config>` |
       :doc:`Relationship Configuration <orm/relationships>`
 
     * **ORM Usage:**
@@ -160,4 +161,5 @@ SQLAlchemy Documentation
     * :doc:`Glossary <glossary>` - Terms used in SQLAlchemy's documentation
     * :doc:`Error Message Guide <errors>` - Explainations of many SQLAlchemy Errors
     * :doc:`Complete table of of contents <contents>`
-    * :doc:`Index <index>`
+    * :ref:`Index <genindex>`
+

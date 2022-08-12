@@ -42,6 +42,8 @@ class PyODBCConnector(Connector):
     supports_native_decimal = True
     default_paramstyle = "named"
 
+    fast_executemany = False
+
     # for non-DSN connections, this *may* be used to
     # hold the desired driver name
     pyodbc_driver_name: Optional[str] = None
@@ -77,7 +79,7 @@ class PyODBCConnector(Connector):
         else:
 
             def check_quote(token: str) -> str:
-                if ";" in str(token):
+                if ";" in str(token) or str(token).startswith("{"):
                     token = "{%s}" % token.replace("}", "}}")
                 return token
 
@@ -143,7 +145,9 @@ class PyODBCConnector(Connector):
     def is_disconnect(
         self,
         e: Exception,
-        connection: Optional[pool.PoolProxiedConnection],
+        connection: Optional[
+            Union[pool.PoolProxiedConnection, interfaces.DBAPIConnection]
+        ],
         cursor: Optional[interfaces.DBAPICursor],
     ) -> bool:
         if isinstance(e, self.dbapi.ProgrammingError):
@@ -178,7 +182,7 @@ class PyODBCConnector(Connector):
         dbapi_con = connection.connection.dbapi_connection
         version: Tuple[Union[int, str], ...] = ()
         r = re.compile(r"[.\-]")
-        for n in r.split(dbapi_con.getinfo(self.dbapi.SQL_DBMS_VER)):  # type: ignore[union-attr]  # noqa E501
+        for n in r.split(dbapi_con.getinfo(self.dbapi.SQL_DBMS_VER)):  # type: ignore[union-attr]  # noqa: E501
             try:
                 version += (int(n),)
             except ValueError:
@@ -201,6 +205,13 @@ class PyODBCConnector(Connector):
         # parameter were not passed to the dialect, or if no types were
         # specified in list_of_tuples
 
+        # as of #8177 for 2.0 we assume use_setinputsizes=True and only
+        # omit the setinputsizes calls for .executemany() with
+        # fast_executemany=True
+
+        if context.executemany and self.fast_executemany:
+            return
+
         cursor.setinputsizes(
             [
                 (dbtype, None, None)
@@ -213,7 +224,7 @@ class PyODBCConnector(Connector):
     def get_isolation_level_values(
         self, dbapi_connection: interfaces.DBAPIConnection
     ) -> List[_IsolationLevel]:
-        return super().get_isolation_level_values(dbapi_connection) + [  # type: ignore  # noqa E501
+        return super().get_isolation_level_values(dbapi_connection) + [  # type: ignore  # noqa: E501
             "AUTOCOMMIT"
         ]
 

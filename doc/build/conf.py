@@ -23,10 +23,12 @@ sys.path.insert(0, os.path.abspath("../.."))  # examples
 sys.path.insert(0, os.path.abspath("."))
 
 
+os.environ["DISABLE_SQLALCHEMY_CEXT_RUNTIME"] = "true"
+
 # -- General configuration --------------------------------------------------
 
 # If your documentation needs a minimal Sphinx version, state it here.
-needs_sphinx = "3.5.0"
+needs_sphinx = "5.0.1"
 
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
@@ -107,7 +109,26 @@ changelog_render_pullreq = {
 
 changelog_render_changeset = "https://www.sqlalchemy.org/trac/changeset/%s"
 
-exclude_patterns = ["build", "**/unreleased*/*", "*_include.rst"]
+exclude_patterns = ["build", "**/unreleased*/*", "**/*_include.rst"]
+
+autodoc_class_signature = "separated"
+
+autodoc_default_options = {
+    "exclude-members": "__new__",
+    "undoc-members": False,
+}
+
+# enable "annotation" indicator.  doesn't actually use this
+# link right now, it's just a png image
+zzzeeksphinx_annotation_key = "glossary#annotated-example"
+
+# to use this, we need:
+# 1. fix sphinx-paramlinks to work with "description" typing
+# 2. we need a huge autodoc_type_aliases map as we have extensive type aliasing
+# present, and typing is largely not very legible w/ the aliases
+# autodoc_typehints = "description"
+# autodoc_typehints_format = "short"
+# autodoc_typehints_description_target = "documented"
 
 # zzzeeksphinx makes these conversions when it is rendering the
 # docstrings classes, methods, and functions within the scope of

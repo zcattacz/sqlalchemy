@@ -15,6 +15,7 @@ from sqlalchemy import Table
 from sqlalchemy import testing
 from sqlalchemy import text
 from sqlalchemy import union_all
+from sqlalchemy.engine import cursor as _cursor
 from sqlalchemy.ext.asyncio import async_engine_from_config
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.ext.asyncio import engine as _async_engine
@@ -480,6 +481,28 @@ class AsyncEngineTest(EngineFixture):
             eq_(async_engine.pool.checkedin(), 0)
         is_not(p1, async_engine.pool)
 
+    @testing.requires.queue_pool
+    @async_test
+    async def test_dispose_no_close(self, async_engine):
+        c1 = await async_engine.connect()
+        c2 = await async_engine.connect()
+
+        await c1.close()
+        await c2.close()
+
+        p1 = async_engine.pool
+
+        if isinstance(p1, AsyncAdaptedQueuePool):
+            eq_(async_engine.pool.checkedin(), 2)
+
+        await async_engine.dispose(close=False)
+
+        # TODO: test that DBAPI connection was not closed
+
+        if isinstance(p1, AsyncAdaptedQueuePool):
+            eq_(async_engine.pool.checkedin(), 0)
+        is_not(p1, async_engine.pool)
+
     @testing.requires.independent_connections
     @async_test
     async def test_init_once_concurrency(self, async_engine):
@@ -878,20 +901,53 @@ class AsyncResultTest(EngineFixture):
     @testing.combinations(
         (None,), ("scalars",), ("mappings",), argnames="filter_"
     )
+    @testing.combinations(None, 2, 5, 10, argnames="yield_per")
+    @testing.combinations("method", "opt", argnames="yield_per_type")
     @async_test
-    async def test_partitions(self, async_engine, filter_):
+    async def test_partitions(
+        self, async_engine, filter_, yield_per, yield_per_type
+    ):
         users = self.tables.users
         async with async_engine.connect() as conn:
-            result = await conn.stream(select(users))
+            stmt = select(users)
+            if yield_per and yield_per_type == "opt":
+                stmt = stmt.execution_options(yield_per=yield_per)
+            result = await conn.stream(stmt)
 
             if filter_ == "mappings":
                 result = result.mappings()
             elif filter_ == "scalars":
                 result = result.scalars(1)
 
+            if yield_per and yield_per_type == "method":
+                result = result.yield_per(yield_per)
+
             check_result = []
-            async for partition in result.partitions(5):
-                check_result.append(partition)
+
+            # stream() sets stream_results unconditionally
+            assert isinstance(
+                result._real_result.cursor_strategy,
+                _cursor.BufferedRowCursorFetchStrategy,
+            )
+
+            if yield_per:
+                partition_size = yield_per
+
+                eq_(result._real_result.cursor_strategy._bufsize, yield_per)
+
+                async for partition in result.partitions():
+                    check_result.append(partition)
+            else:
+                eq_(result._real_result.cursor_strategy._bufsize, 5)
+
+                partition_size = 5
+                async for partition in result.partitions(partition_size):
+                    check_result.append(partition)
+
+            ranges = [
+                (i, min(20, i + partition_size))
+                for i in range(1, 21, partition_size)
+            ]
 
             if filter_ == "mappings":
                 eq_(
@@ -901,23 +957,20 @@ class AsyncResultTest(EngineFixture):
                             {"user_id": i, "user_name": "name%d" % i}
                             for i in range(a, b)
                         ]
-                        for (a, b) in [(1, 6), (6, 11), (11, 16), (16, 20)]
+                        for (a, b) in ranges
                     ],
                 )
             elif filter_ == "scalars":
                 eq_(
                     check_result,
-                    [
-                        ["name%d" % i for i in range(a, b)]
-                        for (a, b) in [(1, 6), (6, 11), (11, 16), (16, 20)]
-                    ],
+                    [["name%d" % i for i in range(a, b)] for (a, b) in ranges],
                 )
             else:
                 eq_(
                     check_result,
                     [
                         [(i, "name%d" % i) for i in range(a, b)]
-                        for (a, b) in [(1, 6), (6, 11), (11, 16), (16, 20)]
+                        for (a, b) in ranges
                     ],
                 )
 
@@ -988,6 +1041,8 @@ class AsyncResultTest(EngineFixture):
 
 
 class TextSyncDBAPI(fixtures.TestBase):
+    __requires__ = ("asyncio",)
+
     def test_sync_dbapi_raises(self):
         with expect_raises_message(
             exc.InvalidRequestError,

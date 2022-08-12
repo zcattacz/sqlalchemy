@@ -489,20 +489,38 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
             "SELECT cs1.x, cs2.x AS x_1 FROM bar AS cs1, cte AS cs2",
         )
 
-    def test_conflicting_names(self):
+    @testing.combinations(True, False, argnames="identical")
+    @testing.combinations(True, False, argnames="use_clone")
+    def test_conflicting_names(self, identical, use_clone):
         """test a flat out name conflict."""
 
         s1 = select(1)
         c1 = s1.cte(name="cte1", recursive=True)
-        s2 = select(1)
-        c2 = s2.cte(name="cte1", recursive=True)
+        if use_clone:
+            c2 = c1._clone()
+            if not identical:
+                c2 = c2.union(select(2))
+        else:
+            if identical:
+                s2 = select(1)
+            else:
+                s2 = select(column("q"))
+            c2 = s2.cte(name="cte1", recursive=True)
 
         s = select(c1, c2)
-        assert_raises_message(
-            CompileError,
-            "Multiple, unrelated CTEs found " "with the same name: 'cte1'",
-            s.compile,
-        )
+
+        if use_clone and identical:
+            self.assert_compile(
+                s,
+                'WITH RECURSIVE cte1("1") AS (SELECT 1) SELECT cte1.1, '
+                'cte1.1 AS "1_1" FROM cte1',
+            )
+        else:
+            assert_raises_message(
+                CompileError,
+                "Multiple, unrelated CTEs found " "with the same name: 'cte1'",
+                s.compile,
+            )
 
     def test_with_recursive_no_name_currently_buggy(self):
         s1 = select(1)
@@ -1184,6 +1202,37 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
             'FROM "order") pg suffix  SELECT "order"."order" FROM "order", '
             'regional_sales WHERE "order"."order" > regional_sales."order"',
             dialect="postgresql",
+        )
+
+    def test_recursive_dml_syntax(self):
+        orders = table(
+            "orders",
+            column("region"),
+            column("amount"),
+            column("product"),
+            column("quantity"),
+        )
+
+        upsert = (
+            orders.update()
+            .where(orders.c.region == "Region1")
+            .values(amount=1.0, product="Product1", quantity=1)
+            .returning(*(orders.c._all_columns))
+            .cte("upsert", recursive=True)
+        )
+        stmt = select(upsert)
+
+        # This statement probably makes no sense, just want to see that the
+        # column generation aspect needed by RECURSIVE works (new in 2.0)
+        self.assert_compile(
+            stmt,
+            "WITH RECURSIVE upsert(region, amount, product, quantity) "
+            "AS (UPDATE orders SET amount=:param_1, product=:param_2, "
+            "quantity=:param_3 WHERE orders.region = :region_1 "
+            "RETURNING orders.region, orders.amount, orders.product, "
+            "orders.quantity) "
+            "SELECT upsert.region, upsert.amount, upsert.product, "
+            "upsert.quantity FROM upsert",
         )
 
     def test_upsert_from_select(self):

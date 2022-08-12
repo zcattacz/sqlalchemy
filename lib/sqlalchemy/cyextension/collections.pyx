@@ -26,6 +26,10 @@ cdef class OrderedSet(set):
 
     cdef list _list
 
+    @classmethod
+    def __class_getitem__(cls, key):
+        return cls
+
     def __init__(self, d=None):
         set.__init__(self)
         if d is not None:
@@ -208,9 +212,6 @@ cdef class IdentitySet:
 
     def clear(self):
         self._members.clear()
-
-    def __cmp__(self, other):
-        raise TypeError("cannot compare sets using cmp()")
 
     def __eq__(self, other):
         cdef IdentitySet other_

@@ -4,6 +4,8 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: ignore-errors
+
 r"""
 .. dialect:: mssql+pyodbc
     :name: PyODBC
@@ -155,6 +157,34 @@ database using Azure credentials::
     stating that a connection string when using an access token must not contain
     ``UID``, ``PWD``, ``Authentication`` or ``Trusted_Connection`` parameters.
 
+.. _azure_synapse_ignore_no_transaction_on_rollback:
+
+Avoiding transaction-related exceptions on Azure Synapse Analytics
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Azure Synapse Analytics has a significant difference in its transaction
+handling compared to plain SQL Server; in some cases an error within a Synapse
+transaction can cause it to be arbitrarily terminated on the server side, which
+then causes the DBAPI ``.rollback()`` method (as well as ``.commit()``) to
+fail. The issue prevents the usual DBAPI contract of allowing ``.rollback()``
+to pass silently if no transaction is present as the driver does not expect
+this condition. The symptom of this failure is an exception with a message
+resembling 'No corresponding transaction found. (111214)' when attempting to
+emit a ``.rollback()`` after an operation had a failure of some kind.
+
+This specific case can be handled by passing ``ignore_no_transaction_on_rollback=True`` to
+the SQL Server dialect via the :func:`_sa.create_engine` function as follows::
+
+    engine = create_engine(connection_url, ignore_no_transaction_on_rollback=True)
+
+Using the above parameter, the dialect will catch ``ProgrammingError``
+exceptions raised during ``connection.rollback()`` and emit a warning
+if the error message contains code ``111214``, however will not raise
+an exception.
+
+.. versionadded:: 1.4.40  Added the
+   ``ignore_no_transaction_on_rollback=True`` parameter.
+
 Enable autocommit for Azure SQL Data Warehouse (DW) connections
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -289,18 +319,19 @@ driver in order to use this flag::
 Setinputsizes Support
 -----------------------
 
-The pyodbc ``cursor.setinputsizes()`` method can be used if necessary.  To
-enable this hook, pass ``use_setinputsizes=True`` to :func:`_sa.create_engine`::
+As of version 2.0, the pyodbc ``cursor.setinputsizes()`` method is used by
+default except for .executemany() calls when fast_executemany=True.
 
-    engine = create_engine("mssql+pyodbc://...", use_setinputsizes=True)
-
-The behavior of the hook can then be customized, as may be necessary
+The behavior of setinputsizes can be customized, as may be necessary
 particularly if fast_executemany is in use, via the
 :meth:`.DialectEvents.do_setinputsizes` hook. See that method for usage
 examples.
 
 .. versionchanged:: 1.4.1  The pyodbc dialects will not use setinputsizes
    unless ``use_setinputsizes=True`` is passed.
+
+.. versionchanged:: 2.0  The mssql+pyodbc dialect now defaults to using
+   setinputsizes except for .executemany() calls when fast_executemany=True.
 
 """  # noqa
 
@@ -310,11 +341,17 @@ import decimal
 import re
 import struct
 
+from .base import _MSDateTime
+from .base import _MSUnicode
+from .base import _MSUnicodeText
 from .base import BINARY
 from .base import DATETIMEOFFSET
 from .base import MSDialect
 from .base import MSExecutionContext
 from .base import VARBINARY
+from .json import JSON as _MSJson
+from .json import JSONIndexType as _MSJsonIndexType
+from .json import JSONPathType as _MSJsonPathType
 from ... import exc
 from ... import types as sqltypes
 from ... import util
@@ -447,7 +484,7 @@ class _ODBCDateTimeBindProcessor:
         return process
 
 
-class _ODBCDateTime(_ODBCDateTimeBindProcessor, sqltypes.DateTime):
+class _ODBCDateTime(_ODBCDateTimeBindProcessor, _MSDateTime):
     pass
 
 
@@ -461,6 +498,36 @@ class _VARBINARY_pyodbc(_ms_binary_pyodbc, VARBINARY):
 
 class _BINARY_pyodbc(_ms_binary_pyodbc, BINARY):
     pass
+
+
+class _String_pyodbc(sqltypes.String):
+    def get_dbapi_type(self, dbapi):
+        return dbapi.SQL_VARCHAR
+
+
+class _Unicode_pyodbc(_MSUnicode):
+    def get_dbapi_type(self, dbapi):
+        return dbapi.SQL_WVARCHAR
+
+
+class _UnicodeText_pyodbc(_MSUnicodeText):
+    def get_dbapi_type(self, dbapi):
+        return dbapi.SQL_WVARCHAR
+
+
+class _JSON_pyodbc(_MSJson):
+    def get_dbapi_type(self, dbapi):
+        return dbapi.SQL_WVARCHAR
+
+
+class _JSONIndexType_pyodbc(_MSJsonIndexType):
+    def get_dbapi_type(self, dbapi):
+        return dbapi.SQL_WVARCHAR
+
+
+class _JSONPathType_pyodbc(_MSJsonPathType):
+    def get_dbapi_type(self, dbapi):
+        return dbapi.SQL_WVARCHAR
 
 
 class MSExecutionContext_pyodbc(MSExecutionContext):
@@ -519,6 +586,8 @@ class MSDialect_pyodbc(PyODBCConnector, MSDialect):
     # mssql still has problems with this on Linux
     supports_sane_rowcount_returning = False
 
+    favor_returning_over_lastrowid = True
+
     execution_ctx_cls = MSExecutionContext_pyodbc
 
     colspecs = util.update_copy(
@@ -536,11 +605,28 @@ class MSDialect_pyodbc(PyODBCConnector, MSDialect):
             VARBINARY: _VARBINARY_pyodbc,
             sqltypes.VARBINARY: _VARBINARY_pyodbc,
             sqltypes.LargeBinary: _VARBINARY_pyodbc,
+            sqltypes.String: _String_pyodbc,
+            sqltypes.Unicode: _Unicode_pyodbc,
+            sqltypes.UnicodeText: _UnicodeText_pyodbc,
+            sqltypes.JSON: _JSON_pyodbc,
+            sqltypes.JSON.JSONIndexType: _JSONIndexType_pyodbc,
+            sqltypes.JSON.JSONPathType: _JSONPathType_pyodbc,
+            # this excludes Enum from the string/VARCHAR thing for now
+            # it looks like Enum's adaptation doesn't really support the
+            # String type itself having a dialect-level impl
+            sqltypes.Enum: sqltypes.Enum,
         },
     )
 
-    def __init__(self, fast_executemany=False, **params):
-        super(MSDialect_pyodbc, self).__init__(**params)
+    def __init__(
+        self,
+        fast_executemany=False,
+        use_setinputsizes=True,
+        **params,
+    ):
+        super(MSDialect_pyodbc, self).__init__(
+            use_setinputsizes=use_setinputsizes, **params
+        )
         self.use_scope_identity = (
             self.use_scope_identity
             and self.dbapi

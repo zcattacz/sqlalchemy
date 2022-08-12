@@ -3,6 +3,8 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: ignore-errors
+
 
 import typing
 
@@ -58,7 +60,8 @@ class Insert(StandardInsert):
 
     @property
     def inserted(self):
-        """Provide the "inserted" namespace for an ON DUPLICATE KEY UPDATE statement
+        """Provide the "inserted" namespace for an ON DUPLICATE KEY UPDATE
+        statement
 
         MySQL's ON DUPLICATE KEY UPDATE clause allows reference to the row
         that would be inserted, via a special function called ``VALUES()``.
@@ -126,7 +129,7 @@ class Insert(StandardInsert):
          in the UPDATE clause should be ordered as sent, in a manner similar
          to that described for the :class:`_expression.Update`
          construct overall
-         in :ref:`updates_order_parameters`::
+         in :ref:`tutorial_parameter_ordered_updates`::
 
             insert().on_duplicate_key_update(
                 [("name", "some name"), ("value", "some value")])

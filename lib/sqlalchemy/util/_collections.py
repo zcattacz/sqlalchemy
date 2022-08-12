@@ -4,6 +4,7 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: allow-untyped-defs, allow-untyped-calls
 
 """Collection classes and helpers."""
 from __future__ import annotations
@@ -22,8 +23,11 @@ from typing import Generic
 from typing import Iterable
 from typing import Iterator
 from typing import List
+from typing import Mapping
+from typing import NoReturn
 from typing import Optional
 from typing import overload
+from typing import Sequence
 from typing import Set
 from typing import Tuple
 from typing import TypeVar
@@ -38,13 +42,13 @@ from .typing import Protocol
 if typing.TYPE_CHECKING or not HAS_CYEXTENSION:
     from ._py_collections import immutabledict as immutabledict
     from ._py_collections import IdentitySet as IdentitySet
-    from ._py_collections import ImmutableContainer as ImmutableContainer
+    from ._py_collections import ReadOnlyContainer as ReadOnlyContainer
     from ._py_collections import ImmutableDictBase as ImmutableDictBase
     from ._py_collections import OrderedSet as OrderedSet
     from ._py_collections import unique_list as unique_list
 else:
     from sqlalchemy.cyextension.immutabledict import (
-        ImmutableContainer as ImmutableContainer,
+        ReadOnlyContainer as ReadOnlyContainer,
     )
     from sqlalchemy.cyextension.immutabledict import (
         ImmutableDictBase as ImmutableDictBase,
@@ -67,7 +71,7 @@ _T_co = TypeVar("_T_co", covariant=True)
 EMPTY_SET: FrozenSet[Any] = frozenset()
 
 
-def merge_lists_w_ordering(a, b):
+def merge_lists_w_ordering(a: List[Any], b: List[Any]) -> List[Any]:
     """merge two lists, maintaining ordering as much as possible.
 
     this is to reconcile vars(cls) with cls.__annotations__.
@@ -123,7 +127,7 @@ def merge_lists_w_ordering(a, b):
     return result
 
 
-def coerce_to_immutabledict(d):
+def coerce_to_immutabledict(d: Mapping[_KT, _VT]) -> immutabledict[_KT, _VT]:
     if not d:
         return EMPTY_DICT
     elif isinstance(d, immutabledict):
@@ -135,31 +139,33 @@ def coerce_to_immutabledict(d):
 EMPTY_DICT: immutabledict[Any, Any] = immutabledict()
 
 
-class FacadeDict(ImmutableDictBase[Any, Any]):
+class FacadeDict(ImmutableDictBase[_KT, _VT]):
     """A dictionary that is not publicly mutable."""
 
-    def __new__(cls, *args):
+    def __new__(cls, *args: Any) -> FacadeDict[Any, Any]:
         new = dict.__new__(cls)
         return new
 
-    def copy(self):
+    def copy(self) -> NoReturn:
         raise NotImplementedError(
             "an immutabledict shouldn't need to be copied.  use dict(d) "
             "if you need a mutable dictionary."
         )
 
-    def __reduce__(self):
+    def __reduce__(self) -> Any:
         return FacadeDict, (dict(self),)
 
-    def _insert_item(self, key, value):
+    def _insert_item(self, key: _KT, value: _VT) -> None:
         """insert an item into the dictionary directly."""
         dict.__setitem__(self, key, value)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "FacadeDict(%s)" % dict.__repr__(self)
 
 
 _DT = TypeVar("_DT", bound=Any)
+
+_F = TypeVar("_F", bound=Any)
 
 
 class Properties(Generic[_T]):
@@ -169,7 +175,7 @@ class Properties(Generic[_T]):
 
     _data: Dict[str, _T]
 
-    def __init__(self, data):
+    def __init__(self, data: Dict[str, _T]):
         object.__setattr__(self, "_data", data)
 
     def __len__(self) -> int:
@@ -178,30 +184,30 @@ class Properties(Generic[_T]):
     def __iter__(self) -> Iterator[_T]:
         return iter(list(self._data.values()))
 
-    def __dir__(self):
+    def __dir__(self) -> List[str]:
         return dir(super(Properties, self)) + [
             str(k) for k in self._data.keys()
         ]
 
-    def __add__(self, other):
-        return list(self) + list(other)
+    def __add__(self, other: Properties[_F]) -> List[Union[_T, _F]]:
+        return list(self) + list(other)  # type: ignore
 
-    def __setitem__(self, key, obj):
+    def __setitem__(self, key: str, obj: _T) -> None:
         self._data[key] = obj
 
     def __getitem__(self, key: str) -> _T:
         return self._data[key]
 
-    def __delitem__(self, key):
+    def __delitem__(self, key: str) -> None:
         del self._data[key]
 
-    def __setattr__(self, key, obj):
+    def __setattr__(self, key: str, obj: _T) -> None:
         self._data[key] = obj
 
-    def __getstate__(self):
+    def __getstate__(self) -> Dict[str, Any]:
         return {"_data": self._data}
 
-    def __setstate__(self, state):
+    def __setstate__(self, state: Dict[str, Any]) -> None:
         object.__setattr__(self, "_data", state["_data"])
 
     def __getattr__(self, key: str) -> _T:
@@ -213,12 +219,12 @@ class Properties(Generic[_T]):
     def __contains__(self, key: str) -> bool:
         return key in self._data
 
-    def as_immutable(self) -> "ImmutableProperties[_T]":
+    def as_readonly(self) -> ReadOnlyProperties[_T]:
         """Return an immutable proxy for this :class:`.Properties`."""
 
-        return ImmutableProperties(self._data)
+        return ReadOnlyProperties(self._data)
 
-    def update(self, value):
+    def update(self, value: Dict[str, _T]) -> None:
         self._data.update(value)
 
     @overload
@@ -249,7 +255,7 @@ class Properties(Generic[_T]):
     def has_key(self, key: str) -> bool:
         return key in self._data
 
-    def clear(self):
+    def clear(self) -> None:
         self._data.clear()
 
 
@@ -263,7 +269,7 @@ class OrderedProperties(Properties[_T]):
         Properties.__init__(self, OrderedDict())
 
 
-class ImmutableProperties(ImmutableContainer, Properties[_T]):
+class ReadOnlyProperties(ReadOnlyContainer, Properties[_T]):
     """Provide immutable dict/object attribute to an underlying dictionary."""
 
     __slots__ = ()
@@ -283,8 +289,8 @@ OrderedDict = dict
 sort_dictionary = _ordered_dictionary_sort
 
 
-class WeakSequence:
-    def __init__(self, __elements=()):
+class WeakSequence(Sequence[_T]):
+    def __init__(self, __elements: Sequence[_T] = ()):
         # adapted from weakref.WeakKeyDictionary, prevent reference
         # cycles in the collection itself
         def _remove(item, selfref=weakref.ref(self)):
@@ -318,7 +324,7 @@ class WeakSequence:
 
 
 class OrderedIdentitySet(IdentitySet):
-    def __init__(self, iterable=None):
+    def __init__(self, iterable: Optional[Iterable[Any]] = None):
         IdentitySet.__init__(self)
         self._members = OrderedDict()
         if iterable:
@@ -388,11 +394,11 @@ class UniqueAppender(Generic[_T]):
         self.data = data
         self._unique = {}
         if via:
-            self._data_appender = getattr(data, via)  # type: ignore[assignment]  # noqa E501
+            self._data_appender = getattr(data, via)  # type: ignore[assignment]  # noqa: E501
         elif hasattr(data, "append"):
-            self._data_appender = cast("List[_T]", data).append  # type: ignore[assignment]  # noqa E501
+            self._data_appender = cast("List[_T]", data).append  # type: ignore[assignment]  # noqa: E501
         elif hasattr(data, "add"):
-            self._data_appender = cast("Set[_T]", data).add  # type: ignore[assignment]  # noqa E501
+            self._data_appender = cast("Set[_T]", data).add  # type: ignore[assignment]  # noqa: E501
 
     def append(self, item: _T) -> None:
         id_ = id(item)
@@ -404,11 +410,11 @@ class UniqueAppender(Generic[_T]):
         return iter(self.data)
 
 
-def coerce_generator_arg(arg):
+def coerce_generator_arg(arg: Any) -> List[Any]:
     if len(arg) == 1 and isinstance(arg[0], types.GeneratorType):
         return list(arg[0])
     else:
-        return arg
+        return cast("List[Any]", arg)
 
 
 def to_list(x: Any, default: Optional[List[Any]] = None) -> List[Any]:
@@ -444,7 +450,7 @@ def to_set(x):
         return x
 
 
-def to_column_set(x):
+def to_column_set(x: Any) -> Set[Any]:
     if x is None:
         return column_set()
     if not isinstance(x, column_set):
@@ -463,11 +469,12 @@ def update_copy(d, _new=None, **kw):
     return d
 
 
-def flatten_iterator(x):
+def flatten_iterator(x: Iterable[_T]) -> Iterator[_T]:
     """Given an iterator of which further sub-elements may also be
     iterators, flatten the sub-elements into a single iterator.
 
     """
+    elem: _T
     for elem in x:
         if not isinstance(elem, str) and hasattr(elem, "__iter__"):
             for y in flatten_iterator(elem):
@@ -614,7 +621,9 @@ class ScopedRegistry(Generic[_T]):
     scopefunc: _ScopeFuncType
     registry: Any
 
-    def __init__(self, createfunc, scopefunc):
+    def __init__(
+        self, createfunc: Callable[[], _T], scopefunc: Callable[[], Any]
+    ):
         """Construct a new :class:`.ScopedRegistry`.
 
         :param createfunc:  A creation function that will generate

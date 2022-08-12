@@ -51,8 +51,6 @@ from ..util.typing import Literal
 from ..util.typing import Protocol
 
 if typing.TYPE_CHECKING:
-    from .elements import BinaryExpression
-    from .elements import ColumnElement
     from .type_api import TypeEngine
 
 _T = TypeVar("_T", bound=Any)
@@ -219,14 +217,17 @@ class Operators:
          A value of 100 will be higher or equal to all operators, and -100
          will be lower than or equal to all operators.
 
-        :param is_comparison: if True, the operator will be considered as a
-         "comparison" operator, that is which evaluates to a boolean
-         true/false value, like ``==``, ``>``, etc.  This flag should be set
+        :param is_comparison: legacy; if True, the operator will be considered
+         as a "comparison" operator, that is which evaluates to a boolean
+         true/false value, like ``==``, ``>``, etc.  This flag is provided
          so that ORM relationships can establish that the operator is a
          comparison operator when used in a custom join condition.
 
-         .. versionadded:: 0.9.2 - added the
-            :paramref:`.Operators.op.is_comparison` flag.
+         Using the ``is_comparison`` parameter is superseded by using the
+         :meth:`.Operators.bool_op` method instead;  this more succinct
+         operator sets this parameter automatically, but also provides
+         correct :pep:`484` typing support as the returned object will
+         express a "boolean" datatype, i.e. ``BinaryExpression[bool]``.
 
         :param return_type: a :class:`.TypeEngine` class or object that will
           force the return type of an expression produced by this operator
@@ -257,6 +258,8 @@ class Operators:
 
         .. seealso::
 
+            :meth:`.Operators.bool_op`
+
             :ref:`types_operators`
 
             :ref:`relationship_custom_operator`
@@ -286,7 +289,9 @@ class Operators:
         This method is shorthand for calling
         :meth:`.Operators.op` and passing the
         :paramref:`.Operators.op.is_comparison`
-        flag with True.
+        flag with True.    A key advantage to using :meth:`.Operators.bool_op`
+        is that when using column constructs, the "boolean" nature of the
+        returned expression will be present for :pep:`484` purposes.
 
         .. seealso::
 
@@ -315,8 +320,8 @@ class Operators:
         side::
 
             class MyComparator(ColumnOperators):
-                def operate(self, op, other):
-                    return op(func.lower(self), func.lower(other))
+                def operate(self, op, other, **kwargs):
+                    return op(func.lower(self), func.lower(other), **kwargs)
 
         :param op:  Operator callable.
         :param \*other: the 'other' side of the operation. Will
@@ -417,7 +422,7 @@ class custom_op(OperatorType, Generic[_T]):
         if hasattr(left, "__sa_operate__"):
             return left.operate(self, right, *other, **kwargs)
         elif self.python_impl:
-            return self.python_impl(left, right, *other, **kwargs)  # type: ignore  # noqa E501
+            return self.python_impl(left, right, *other, **kwargs)  # type: ignore  # noqa: E501
         else:
             raise exc.InvalidRequestError(
                 f"Custom operator {self.opstring!r} can't be used with "
@@ -609,6 +614,16 @@ class ColumnOperators(Operators):
 
         """
         return self.operate(concat_op, other)
+
+    def _rconcat(self, other: Any) -> ColumnOperators:
+        """Implement an 'rconcat' operator.
+
+        this is for internal use at the moment
+
+        .. versionadded:: 1.4.40
+
+        """
+        return self.reverse_operate(concat_op, other)
 
     def like(
         self, other: Any, escape: Optional[str] = None
@@ -1124,7 +1139,13 @@ class ColumnOperators(Operators):
         a MATCH-like function or operator provided by the backend.
         Examples include:
 
-        * PostgreSQL - renders ``x @@ to_tsquery(y)``
+        * PostgreSQL - renders ``x @@ plainto_tsquery(y)``
+
+            .. versionchanged:: 2.0  ``plainto_tsquery()`` is used instead
+               of ``to_tsquery()`` for PostgreSQL now; for compatibility with
+               other forms, see :ref:`postgresql_match`.
+
+
         * MySQL - renders ``MATCH (x) AGAINST (y IN BOOLEAN MODE)``
 
           .. seealso::
@@ -1753,7 +1774,12 @@ def filter_op(a: Any, b: Any) -> Any:
 
 @_operator_fn
 def concat_op(a: Any, b: Any) -> Any:
-    return a.concat(b)
+    try:
+        concat = a.concat
+    except AttributeError:
+        return b._rconcat(a)
+    else:
+        return concat(b)
 
 
 @_operator_fn

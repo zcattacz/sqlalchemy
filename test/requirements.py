@@ -76,12 +76,28 @@ class DefaultRequirements(SuiteRequirements):
         return skip_if(no_support("sqlite", "not supported by database"))
 
     @property
+    def foreign_keys_reflect_as_index(self):
+        return only_on(["mysql", "mariadb"])
+
+    @property
+    def unique_index_reflect_as_unique_constraints(self):
+        return only_on(["mysql", "mariadb"])
+
+    @property
+    def unique_constraints_reflect_as_index(self):
+        return only_on(["mysql", "mariadb", "oracle", "postgresql", "mssql"])
+
+    @property
     def foreign_key_constraint_name_reflection(self):
         return fails_if(
             lambda config: against(config, ["mysql", "mariadb"])
             and not self._mysql_80(config)
             and not self._mariadb_105(config)
         )
+
+    @property
+    def reflect_indexes_with_ascdesc(self):
+        return fails_if(["oracle"])
 
     @property
     def table_ddl_if_exists(self):
@@ -155,6 +171,10 @@ class DefaultRequirements(SuiteRequirements):
         return only_on(["postgresql", "mysql", "mariadb", "oracle"])
 
     @property
+    def constraint_comment_reflection(self):
+        return only_on(["postgresql"])
+
+    @property
     def unbounded_varchar(self):
         """Target database must support VARCHAR with no length"""
 
@@ -198,7 +218,7 @@ class DefaultRequirements(SuiteRequirements):
 
     @property
     def named_paramstyle(self):
-        return only_on(["sqlite", "oracle+cx_oracle"])
+        return only_on(["sqlite", "oracle+cx_oracle", "oracle+oracledb"])
 
     @property
     def format_paramstyle(self):
@@ -416,7 +436,7 @@ class DefaultRequirements(SuiteRequirements):
 
     @property
     def sql_expressions_inserted_as_primary_key(self):
-        return only_if([self.returning, self.sqlite])
+        return only_if([self.insert_returning, self.sqlite])
 
     @property
     def computed_columns_on_update_returning(self):
@@ -447,11 +467,11 @@ class DefaultRequirements(SuiteRequirements):
         )
 
     @property
-    def delete_from(self):
+    def delete_using(self):
         """Target must support DELETE FROM..FROM or DELETE..USING syntax"""
         return only_on(
             ["postgresql", "mssql", "mysql", "mariadb"],
-            "Backend does not support DELETE..FROM",
+            "Backend does not support DELETE..USING or equivalent",
         )
 
     @property
@@ -508,6 +528,12 @@ class DefaultRequirements(SuiteRequirements):
         return exclusions.open()
 
     @property
+    def schema_create_delete(self):
+        """target database supports schema create and dropped with
+        'CREATE SCHEMA' and 'DROP SCHEMA'"""
+        return exclusions.skip_if(["sqlite", "oracle"])
+
+    @property
     def cross_schema_fk_reflection(self):
         """target system must support reflection of inter-schema foreign
         keys"""
@@ -547,11 +573,13 @@ class DefaultRequirements(SuiteRequirements):
 
     @property
     def check_constraint_reflection(self):
-        return fails_on_everything_except(
-            "postgresql",
-            "sqlite",
-            "oracle",
-            self._mysql_and_check_constraints_exist,
+        return only_on(
+            [
+                "postgresql",
+                "sqlite",
+                "oracle",
+                self._mysql_and_check_constraints_exist,
+            ]
         )
 
     @property
@@ -559,10 +587,16 @@ class DefaultRequirements(SuiteRequirements):
         return only_on(["postgresql", "sqlite>=3.9.0"])
 
     @property
+    def reflect_indexes_with_expressions(self):
+        return only_on(["postgresql"])
+
+    @property
     def temp_table_names(self):
         """target dialect supports listing of temporary table names"""
 
-        return only_on(["sqlite", "oracle"]) + skip_if(self._sqlite_file_db)
+        return only_on(["sqlite", "oracle", "postgresql"]) + skip_if(
+            self._sqlite_file_db
+        )
 
     @property
     def temporary_views(self):
@@ -674,10 +708,22 @@ class DefaultRequirements(SuiteRequirements):
 
         E.g.  (SELECT id, ...) UNION (SELECT id, ...) ORDER BY id
 
-        Fails on SQL Server
+        Fails on SQL Server and oracle.
+
+        Previously on Oracle, prior to #8221, the ROW_NUMBER subquerying
+        applied to queries allowed the test at
+        suite/test_select.py ->
+        CompoundSelectTest.test_limit_offset_selectable_in_unions
+        to pass, because of the implicit subquerying thus creating a query
+        that was more in line with the syntax
+        illustrated at
+        https://stackoverflow.com/a/6036814/34549.  However, Oracle doesn't
+        support the above (SELECT ..) UNION (SELECT ..) ORDER BY syntax
+        at all.  So those tests are now not supported w/ Oracle as of
+        #8221.
 
         """
-        return fails_if("mssql")
+        return fails_if(["mssql", "oracle>=12"])
 
     @property
     def parens_in_union_contained_select_w_limit_offset(self):
@@ -751,27 +797,32 @@ class DefaultRequirements(SuiteRequirements):
                 else:
                     return num > 0
 
-        return skip_if(
-            [
-                no_support("mssql", "two-phase xact not supported by drivers"),
-                no_support(
-                    "sqlite", "two-phase xact not supported by database"
-                ),
-                # in Ia3cbbf56d4882fcc7980f90519412f1711fae74d
-                # we are evaluating which modern MySQL / MariaDB versions
-                # can handle two-phase testing without too many problems
-                # no_support(
-                #     "mysql",
-                #    "recent MySQL communiity editions have too many issues "
-                #    "(late 2016), disabling for now",
-                # ),
-                NotPredicate(
-                    LambdaPredicate(
-                        pg_prepared_transaction,
-                        "max_prepared_transactions not available or zero",
-                    )
-                ),
-            ]
+        return (
+            skip_if(
+                [
+                    no_support(
+                        "mssql", "two-phase xact not supported by drivers"
+                    ),
+                    no_support(
+                        "sqlite", "two-phase xact not supported by database"
+                    ),
+                    # in Ia3cbbf56d4882fcc7980f90519412f1711fae74d
+                    # we are evaluating which modern MySQL / MariaDB versions
+                    # can handle two-phase testing without too many problems
+                    # no_support(
+                    #     "mysql",
+                    #    "recent MySQL community editions have too many "
+                    #    "issues (late 2016), disabling for now",
+                    # ),
+                    NotPredicate(
+                        LambdaPredicate(
+                            pg_prepared_transaction,
+                            "max_prepared_transactions not available or zero",
+                        )
+                    ),
+                ]
+            )
+            + self.fail_on_oracledb_thin
         )
 
     @property
@@ -787,8 +838,7 @@ class DefaultRequirements(SuiteRequirements):
     @property
     def views(self):
         """Target database must support VIEWs."""
-
-        return skip_if("drizzle", "no VIEW support")
+        return exclusions.open()
 
     @property
     def empty_strings_varchar(self):
@@ -851,6 +901,15 @@ class DefaultRequirements(SuiteRequirements):
         return exclusions.open()
 
     @property
+    def unicode_data_no_special_types(self):
+        """Target database/dialect can receive / deliver / compare data with
+        non-ASCII characters in plain VARCHAR, TEXT columns, without the need
+        for special "national" datatypes like NVARCHAR or similar.
+
+        """
+        return exclusions.fails_on("mssql")
+
+    @property
     def unicode_ddl(self):
         """Target driver must support some degree of non-ascii symbol names."""
 
@@ -880,6 +939,18 @@ class DefaultRequirements(SuiteRequirements):
             "sqlite+pysqlite",
             "sqlite+pysqlcipher",
             "mssql",
+        )
+
+    @property
+    def database_discards_null_for_autoincrement(self):
+        """target database autoincrements a primary key and populates
+        .lastrowid even if NULL is explicitly passed for the column.
+
+        """
+        return succeeds_if(
+            lambda config: (
+                config.db.dialect.insert_null_pk_still_autoincrements
+            )
         )
 
     @property
@@ -943,12 +1014,7 @@ class DefaultRequirements(SuiteRequirements):
 
     @property
     def array_type(self):
-        return only_on(
-            [
-                lambda config: against(config, "postgresql")
-                and not against(config, "+pg8000")
-            ]
-        )
+        return only_on([lambda config: against(config, "postgresql")])
 
     @property
     def json_type(self):
@@ -1047,8 +1113,7 @@ class DefaultRequirements(SuiteRequirements):
         literal string, e.g. via the TypeEngine.literal_processor() method.
 
         """
-
-        return fails_on_everything_except("sqlite")
+        return exclusions.open()
 
     @property
     def datetime(self):
@@ -1288,37 +1353,45 @@ class DefaultRequirements(SuiteRequirements):
 
     @property
     def range_types(self):
-        def check_range_types(config):
-            if not self.psycopg_compatibility.enabled:
-                return False
-            try:
-                with config.db.connect() as conn:
-                    conn.exec_driver_sql("select '[1,2)'::int4range;").scalar()
-                return True
-            except Exception:
-                return False
+        return only_on(["+psycopg2", "+psycopg", "+asyncpg"])
 
-        return only_if(check_range_types)
+    @property
+    def multirange_types(self):
+        return only_on(["+psycopg", "+asyncpg"]) + only_on("postgresql >= 14")
 
     @property
     def async_dialect(self):
         """dialect makes use of await_() to invoke operations on the DBAPI."""
 
-        return only_on(
+        return self.asyncio + only_on(
             LambdaPredicate(
                 lambda config: config.db.dialect.is_async,
                 "Async dialect required",
             )
         )
 
+    def _has_oracle_test_dblink(self, key):
+        def check(config):
+            assert config.db.dialect.name == "oracle"
+            name = config.file_config.get("sqla_testing", key)
+            if not name:
+                return False
+            with config.db.connect() as conn:
+                links = config.db.dialect._list_dblinks(conn)
+                return config.db.dialect.normalize_name(name) in links
+
+        return only_on(["oracle"]) + only_if(
+            check,
+            f"{key} option not specified in config or dblink not found in db",
+        )
+
     @property
     def oracle_test_dblink(self):
-        return skip_if(
-            lambda config: not config.file_config.has_option(
-                "sqla_testing", "oracle_db_link"
-            ),
-            "oracle_db_link option not specified in config",
-        )
+        return self._has_oracle_test_dblink("oracle_db_link")
+
+    @property
+    def oracle_test_dblink2(self):
+        return self._has_oracle_test_dblink("oracle_db_link2")
 
     @property
     def postgresql_test_dblink(self):
@@ -1331,21 +1404,18 @@ class DefaultRequirements(SuiteRequirements):
 
     @property
     def postgresql_jsonb(self):
-        return only_on("postgresql >= 9.4") + skip_if(
-            lambda config: config.db.dialect.driver == "pg8000"
-            and config.db.dialect._dbapi_version <= (1, 10, 1)
-        )
+        return only_on("postgresql >= 9.4")
 
     @property
     def native_hstore(self):
-        return self.psycopg_compatibility
+        return self.any_psycopg_compatibility
 
     @property
     def psycopg2_compatibility(self):
         return only_on(["postgresql+psycopg2", "postgresql+psycopg2cffi"])
 
     @property
-    def psycopg_compatibility(self):
+    def any_psycopg_compatibility(self):
         return only_on(
             [
                 "postgresql+psycopg2",
@@ -1355,8 +1425,12 @@ class DefaultRequirements(SuiteRequirements):
         )
 
     @property
+    def psycopg_only_compatibility(self):
+        return only_on(["postgresql+psycopg"])
+
+    @property
     def psycopg_or_pg8000_compatibility(self):
-        return only_on([self.psycopg_compatibility, "postgresql+pg8000"])
+        return only_on([self.any_psycopg_compatibility, "postgresql+pg8000"])
 
     @property
     def percent_schema_names(self):
@@ -1426,7 +1500,7 @@ class DefaultRequirements(SuiteRequirements):
             if config.db.dialect._dbapi_version() < (4, 0, 19):
                 return False
             with config.db.connect() as conn:
-                drivername = conn.connection.connection.getinfo(
+                drivername = conn.connection.driver_connection.getinfo(
                     config.db.dialect.dbapi.SQL_DRIVER_NAME
                 )
                 # on linux this is something like 'libmsodbcsql-13.1.so.9.2'.
@@ -1589,10 +1663,16 @@ class DefaultRequirements(SuiteRequirements):
 
     @property
     def cxoracle6_or_greater(self):
-        return only_if(
-            lambda config: against(config, "oracle+cx_oracle")
-            and config.db.dialect.cx_oracle_ver >= (6,)
-        )
+        def go(config):
+            return (
+                against(config, "oracle+cx_oracle")
+                and config.db.dialect.cx_oracle_ver >= (6,)
+            ) or (
+                against(config, "oracle+oracledb")
+                and config.db.dialect.oracledb_ver >= (1,)
+            )
+
+        return only_if(go)
 
     @property
     def oracle5x(self):
@@ -1600,6 +1680,16 @@ class DefaultRequirements(SuiteRequirements):
             lambda config: against(config, "oracle+cx_oracle")
             and config.db.dialect.cx_oracle_ver < (6,)
         )
+
+    @property
+    def fail_on_oracledb_thin(self):
+        def go(config):
+            if against(config, "oracle+oracledb"):
+                with config.db.connect() as conn:
+                    return config.db.dialect.is_thin_mode(conn)
+            return False
+
+        return fails_if(go)
 
     @property
     def computed_columns(self):
@@ -1739,3 +1829,35 @@ class DefaultRequirements(SuiteRequirements):
                 return res is not None
 
         return only_on(["mssql"]) + only_if(check)
+
+    @property
+    def reflect_table_options(self):
+        return only_on(["mysql", "mariadb", "oracle"])
+
+    @property
+    def materialized_views(self):
+        """Target database must support MATERIALIZED VIEWs."""
+        return only_on(["postgresql", "oracle"])
+
+    @property
+    def materialized_views_reflect_pk(self):
+        return only_on(["oracle"])
+
+    @property
+    def uuid_data_type(self):
+        """Return databases that support the UUID datatype."""
+        return only_on(("postgresql >= 8.3", "mariadb >= 10.7.0"))
+
+    @property
+    def has_json_each(self):
+        def go(config):
+            try:
+                with config.db.connect() as conn:
+                    conn.exec_driver_sql(
+                        """SELECT x.value FROM json_each('["b", "a"]') as x"""
+                    )
+                return True
+            except exc.DBAPIError:
+                return False
+
+        return only_if(go, "json_each is required")

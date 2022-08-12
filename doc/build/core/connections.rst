@@ -582,20 +582,33 @@ To sum up:
 Using Server Side Cursors (a.k.a. stream results)
 ==================================================
 
-A limited number of dialects have explicit support for the concept of "server
-side cursors" vs. "buffered cursors".    While a server side cursor implies a
-variety of different capabilities, within SQLAlchemy's engine and dialect
-implementation, it refers only to whether or not a particular set of results is
-fully buffered in memory before they are fetched from the cursor, using a
-method such as ``cursor.fetchall()``.   SQLAlchemy has no direct support
-for cursor behaviors such as scrolling; to make use of these features for
-a particular DBAPI, use the cursor directly as documented at
-:ref:`dbapi_connections`.
+Some backends feature explicit support for the concept of "server
+side cursors" versus "client side cursors".  A client side cursor here
+means that the database driver fully fetches all rows from a result set
+into memory before returning from a statement execution.  Drivers such as
+those of PostgreSQL and MySQL/MariaDB generally use client side cursors
+by default.   A server side cursor, by contrast, indicates that result rows
+remain pending within the database server's state as result rows are consumed
+by the client.  The drivers for Oracle generally use a "server side" model,
+for example, and the SQLite dialect, while not using a real "client / server"
+architecture, still uses an unbuffered result fetching approach that will
+leave result rows outside of process memory before they are consumed.
 
-Some DBAPIs, such as the cx_Oracle DBAPI, exclusively use server side cursors
-internally.  All result sets are essentially unbuffered across the total span
-of a result set, utilizing only a smaller buffer that is of a fixed size such
-as 100 rows at a time.
+.. topic:: What we really mean is "buffered" vs. "unbuffered" results
+
+  Server side cursors also imply a wider set of features with relational
+  databases, such as the ability to "scroll" a cursor forwards and backwards.
+  SQLAlchemy does not include any explicit support for these behaviors; within
+  SQLAlchemy itself, the general term "server side cursors" should be considered
+  to mean "unbuffered results" and "client side cursors" means "result rows
+  are buffered into memory before the first row is returned".   To work with
+  a richer "server side cursor" featureset specific to a certain DBAPI driver,
+  see the section :ref:`dbapi_connections_cursor`.
+
+From this basic architecture it follows that a "server side cursor" is more
+memory efficient when fetching very large result sets, while at the same time
+may introduce more complexity in the client/server communication process
+and be less efficient for small result sets (typically less than 10000 rows).
 
 For those dialects that have conditional support for buffered or unbuffered
 results, there are usually caveats to the use of the "unbuffered", or server
@@ -614,75 +627,127 @@ unbuffered cursors are not generally useful except in the uncommon case
 of an application fetching a very large number of rows in chunks, where
 the processing of these rows can be complete before more rows are fetched.
 
-To make use of a server side cursor for a particular execution, the
-:paramref:`_engine.Connection.execution_options.stream_results` option
-is used, which may be called on the :class:`_engine.Connection` object,
-on the statement object, or in the ORM-level contexts mentioned below.
+For database drivers that provide client and server side cursor options,
+the :paramref:`_engine.Connection.execution_options.stream_results`
+and :paramref:`_engine.Connection.execution_options.yield_per` execution
+options provide access to "server side cursors" on a per-:class:`_engine.Connection`
+or per-statement basis.    Similar options exist when using an ORM
+:class:`_orm.Session` as well.
 
-When using this option for a statement, it's usually appropriate to use
-a method like :meth:`_engine.Result.partitions` to work on small sections
-of the result set at a time, while also fetching enough rows for each
-pull so that the operation is efficient::
 
+Streaming with a fixed buffer via yield_per
+--------------------------------------------
+
+As individual row-fetch operations with fully unbuffered server side cursors
+are typically more expensive than fetching batches of rows at once, The
+:paramref:`_engine.Connection.execution_options.yield_per` execution option
+configures a :class:`_engine.Connection` or statement to make use of
+server-side cursors as are available, while at the same time configuring a
+fixed-size buffer of rows that will retrieve rows from the server in batches as
+they are consumed. This parameter may be to a positive integer value using the
+:meth:`_engine.Connection.execution_options` method on
+:class:`_engine.Connection` or on a statement using the
+:meth:`.Executable.execution_options` method.
+
+.. versionadded:: 1.4.40 :paramref:`_engine.Connection.execution_options.yield_per` as a
+   Core-only option is new as of SQLAlchemy 1.4.40; for prior 1.4 versions,
+   use :paramref:`_engine.Connection.execution_options.stream_results`
+   directly in combination with :meth:`_engine.Result.yield_per`.
+
+Using this option is equivalent to manually setting the
+:paramref:`_engine.Connection.execution_options.stream_results` option,
+described in the next section, and then invoking the
+:meth:`_engine.Result.yield_per` method on the :class:`_engine.Result`
+object with the given integer value.   In both cases, the effect this
+combination has includes:
+
+* server side cursors mode is selected for the given backend, if available
+  and not already the default behavior for that backend
+* as result rows are fetched, they will be buffered in batches, where the
+  size of each batch up until the last batch will be equal to the integer
+  argument passed to the
+  :paramref:`_engine.Connection.execution_options.yield_per` option or the
+  :meth:`_engine.Result.yield_per` method; the last batch is then sized against
+  the remaining rows fewer than this size
+* The default partition size used by the :meth:`_engine.Result.partitions`
+  method, if used, will be made equal to this integer size as well.
+
+These three behaviors are illustrated in the example below::
 
     with engine.connect() as conn:
-        result = conn.execution_options(stream_results=True).execute(text("select * from table"))
+        result = (
+          conn.
+          execution_options(yield_per=100).
+          execute(text("select * from table"))
+        )
 
-        for partition in result.partitions(100):
-            _process_rows(partition)
+        for partition in result.partitions():
+            # partition is an iterable that will be at most 100 items
+            for row in partition:
+                print(f"{row}")
 
+The above example illustrates the combination of ``yield_per=100`` along
+with using the :meth:`_engine.Result.partitions` method to run processing
+on rows in batches that match the size fetched from the server.   The
+use of :meth:`_engine.Result.partitions` is optional, and if the
+:class:`_engine.Result` is iterated directly, a new batch of rows will be
+buffered for each 100 rows fetched.    Calling a method such as
+:meth:`_engine.Result.all` should **not** be used, as this will fully
+fetch all remaining rows at once and defeat the purpose of using ``yield_per``.
 
-If the :class:`_engine.Result` is iterated directly, rows are fetched internally
+The :paramref:`_engine.Connection.execution_options.yield_per` option
+is portable to the ORM as well, used by a :class:`_orm.Session` to fetch
+ORM objects, where it also limits the amount of ORM objects generated at once.
+See the section :ref:`orm_queryguide_yield_per` - in the :ref:`queryguide_toplevel`
+for further background on using
+:paramref:`_engine.Connection.execution_options.yield_per` with the ORM.
+
+.. versionadded:: 1.4.40 Added
+   :paramref:`_engine.Connection.execution_options.yield_per`
+   as a Core level execution option to conveniently set streaming results,
+   buffer size, and partition size all at once in a manner that is transferrable
+   to that of the ORM's similar use case.
+
+.. _engine_stream_results_sr:
+
+Streaming with a dynamically growing buffer using stream_results
+-----------------------------------------------------------------
+
+To enable server side cursors without a specific partition size, the
+:paramref:`_engine.Connection.execution_options.stream_results` option may be
+used, which like :paramref:`_engine.Connection.execution_options.yield_per` may
+be called on the :class:`_engine.Connection` object or the statement object.
+
+When a :class:`_engine.Result` object delivered using the
+:paramref:`_engine.Connection.execution_options.stream_results` option
+is iterated directly, rows are fetched internally
 using a default buffering scheme that buffers first a small set of rows,
 then a larger and larger buffer on each fetch up to a pre-configured limit
-of 1000 rows.   This can be affected using the ``max_row_buffer`` execution
-option::
+of 1000 rows.   The maximum size of this buffer can be affected using the
+:paramref:`_engine.Connection.execution_options.max_row_buffer` execution option::
 
     with engine.connect() as conn:
         conn = conn.execution_options(stream_results=True, max_row_buffer=100)
         result = conn.execute(text("select * from table"))
 
         for row in result:
-            _process_row(row)
+            print(f"{row}")
 
-The size of the buffer may also be set to a fixed size using the
-:meth:`_engine.Result.yield_per` method.  Calling this method with a number
-of rows will cause all result-fetching methods to work from
-buffers of the given size, only fetching new rows when the buffer is empty::
+While the :paramref:`_engine.Connection.execution_options.stream_results`
+option may be combined with use of the :meth:`_engine.Result.partitions`
+method, a specific partition size should be passed to
+:meth:`_engine.Result.partitions` so that the entire result is not fetched.
+It is usually more straightforward to use the
+:paramref:`_engine.Connection.execution_options.yield_per` option when setting
+up to use the :meth:`_engine.Result.partitions` method.
 
-    with engine.connect() as conn:
-        result = conn.execution_options(stream_results=True).execute(text("select * from table"))
+.. seealso::
 
-        for row in result.yield_per(100):
-            _process_row(row)
+    :ref:`orm_queryguide_yield_per` - in the :ref:`queryguide_toplevel`
 
-The ``stream_results`` option is also available with the ORM.  When using the
-ORM, either the :meth:`_engine.Result.yield_per` or :meth:`_engine.Result.partitions`
-methods should be used to set the number of ORM rows to be buffered each time
-while yielding::
+    :meth:`_engine.Result.partitions`
 
-    with orm.Session(engine) as session:
-        result = session.execute(
-            select(User).order_by(User_id).execution_options(stream_results=True),
-        )
-        for partition in result.partitions(100):
-            _process_rows(partition)
-
-
-.. note:: ORM result sets currently must make use of :meth:`_engine.Result.yield_per`
-   or :meth:`_engine.Result.partitions` in order to achieve streaming ORM results.
-   If either of these methods are not used to set the number of rows to
-   fetch before yielding, the entire result is fetched before rows are yielded.
-   This may change in a future release so that the automatic buffer size used
-   by :class:`_engine.Connection` takes place for ORM results as well.
-
-When using a :term:`1.x style` ORM query with :class:`_orm.Query`, yield_per is
-available via :meth:`_orm.Query.yield_per` - this also sets the ``stream_results``
-execution option::
-
-    for row in session.query(User).yield_per(100):
-        # process row
-
+    :meth:`_engine.Result.yield_per`
 
 
 .. _schema_translating:
@@ -759,6 +824,18 @@ as the schema name is passed to these methods explicitly.
 
       ...
 
+  .. warning::
+
+    When using the ORM :class:`_orm.Session` without extensions, the schema
+    translate feature is only supported as
+    **a single schema translate map per Session**.   It will **not work** if
+    different schema translate maps are given on a per-statement basis, as
+    the ORM :class:`_orm.Session` does not take current schema translate
+    values into account for individual objects.
+
+    To use a single :class:`_orm.Session` with multiple ``schema_translate_map``
+    configurations, the :ref:`horizontal_sharding_toplevel` extension may
+    be used.  See the example at :ref:`examples_sharding`.
 
 
 .. versionadded:: 1.1
@@ -1397,9 +1474,9 @@ Basic guidelines include:
         def my_stmt(parameter, thing=False):
             stmt = lambda_stmt(lambda: select(table))
             if thing:
-                stmt += s.where(table.c.x > parameter)
+                stmt += lambda s: s.where(table.c.x > parameter)
             else:
-                stmt += s.where(table.c.y == parameter)
+                stmt += lambda s: s.where(table.c.y == parameter)
             return stmt
 
   There are a variety of failures which can occur if the lambda does not
@@ -1708,7 +1785,10 @@ Valid use cases for calling :meth:`_engine.Engine.dispose` include:
   :class:`_engine.Engine` object is copied to the child process,
   :meth:`_engine.Engine.dispose` should be called so that the engine creates
   brand new database connections local to that fork.   Database connections
-  generally do **not** travel across process boundaries.
+  generally do **not** travel across process boundaries.  Use the
+  :paramref:`.Engine.dispose.close` parameter set to False in this case.
+  See the section :ref:`pooling_multiprocessing` for more background on this
+  use case.
 
 * Within test suites or multitenancy scenarios where many
   ad-hoc, short-lived :class:`_engine.Engine` objects may be created and disposed.
@@ -1732,6 +1812,12 @@ entirely.  This typically incurs only a modest performance impact upon the
 use of new connections, and means that when a connection is checked in,
 it is entirely closed out and is not held in memory.  See :ref:`pool_switching`
 for guidelines on how to disable pooling.
+
+.. seealso::
+
+    :ref:`pooling_toplevel`
+
+    :ref:`pooling_multiprocessing`
 
 .. _dbapi_connections:
 
@@ -1760,6 +1846,8 @@ method may be used::
 
 
 .. versionadded:: 1.4  Added the :meth:`_engine.Connection.exec_driver_sql` method.
+
+.. _dbapi_connections_cursor:
 
 Working with the DBAPI cursor directly
 --------------------------------------
@@ -1960,10 +2048,14 @@ Connection / Engine API
 Result Set  API
 =================
 
-.. autoclass:: BaseCursorResult
+.. autoclass:: ChunkedIteratorResult
     :members:
 
-.. autoclass:: ChunkedIteratorResult
+.. autoclass:: CursorResult
+    :members:
+    :inherited-members:
+
+.. autoclass:: FilterResult
     :members:
 
 .. autoclass:: FrozenResult
@@ -1978,22 +2070,14 @@ Result Set  API
 .. autoclass:: Result
     :members:
     :inherited-members:
-    :exclude-members: memoized_attribute, memoized_instancemethod
 
 .. autoclass:: ScalarResult
     :members:
     :inherited-members:
-    :exclude-members: memoized_attribute, memoized_instancemethod
 
 .. autoclass:: MappingResult
     :members:
     :inherited-members:
-    :exclude-members: memoized_attribute, memoized_instancemethod
-
-.. autoclass:: CursorResult
-    :members:
-    :inherited-members:
-    :exclude-members: memoized_attribute, memoized_instancemethod
 
 .. autoclass:: Row
     :members:

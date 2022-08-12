@@ -9,6 +9,10 @@
 copies of SQL constructs which contain context-specific markers and
 associations.
 
+Note that the :class:`.Annotated` concept as implemented in this module is not
+related in any way to the pep-593 concept of "Annotated".
+
+
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from typing import overload
 from typing import Sequence
 from typing import Tuple
 from typing import Type
+from typing import TYPE_CHECKING
 from typing import TypeVar
 
 from . import operators
@@ -35,9 +40,9 @@ from .visitors import InternalTraversal
 from .. import util
 from ..util.typing import Literal
 
-if typing.TYPE_CHECKING:
+if TYPE_CHECKING:
+    from .base import _EntityNamespace
     from .visitors import _TraverseInternalsType
-    from ..util.typing import Self
 
 _AnnotationDict = Mapping[str, Any]
 
@@ -58,7 +63,9 @@ class SupportsAnnotations(ExternallyTraversible):
 
     _is_immutable: bool
 
-    def _annotate(self, values: _AnnotationDict) -> SupportsAnnotations:
+    def _annotate(
+        self: SelfSupportsAnnotations, values: _AnnotationDict
+    ) -> SelfSupportsAnnotations:
         raise NotImplementedError()
 
     @overload
@@ -104,11 +111,6 @@ class SupportsAnnotations(ExternallyTraversible):
         )
 
 
-SelfSupportsCloneAnnotations = TypeVar(
-    "SelfSupportsCloneAnnotations", bound="SupportsCloneAnnotations"
-)
-
-
 class SupportsCloneAnnotations(SupportsAnnotations):
     if not typing.TYPE_CHECKING:
         __slots__ = ()
@@ -118,8 +120,8 @@ class SupportsCloneAnnotations(SupportsAnnotations):
     ]
 
     def _annotate(
-        self: SelfSupportsCloneAnnotations, values: _AnnotationDict
-    ) -> SelfSupportsCloneAnnotations:
+        self: SelfSupportsAnnotations, values: _AnnotationDict
+    ) -> SelfSupportsAnnotations:
         """return a copy of this ClauseElement with annotations
         updated by the given dictionary.
 
@@ -131,8 +133,8 @@ class SupportsCloneAnnotations(SupportsAnnotations):
         return new
 
     def _with_annotations(
-        self: SelfSupportsCloneAnnotations, values: _AnnotationDict
-    ) -> SelfSupportsCloneAnnotations:
+        self: SelfSupportsAnnotations, values: _AnnotationDict
+    ) -> SelfSupportsAnnotations:
         """return a copy of this ClauseElement with annotations
         replaced by the given dictionary.
 
@@ -183,30 +185,34 @@ class SupportsCloneAnnotations(SupportsAnnotations):
             return self
 
 
-SelfSupportsWrappingAnnotations = TypeVar(
-    "SelfSupportsWrappingAnnotations", bound="SupportsWrappingAnnotations"
-)
-
-
 class SupportsWrappingAnnotations(SupportsAnnotations):
     __slots__ = ()
 
     _constructor: Callable[..., SupportsWrappingAnnotations]
-    entity_namespace: Mapping[str, Any]
 
-    def _annotate(self, values: _AnnotationDict) -> Annotated:
+    if TYPE_CHECKING:
+
+        @util.ro_non_memoized_property
+        def entity_namespace(self) -> _EntityNamespace:
+            ...
+
+    def _annotate(
+        self: SelfSupportsAnnotations, values: _AnnotationDict
+    ) -> SelfSupportsAnnotations:
         """return a copy of this ClauseElement with annotations
         updated by the given dictionary.
 
         """
-        return Annotated._as_annotated_instance(self, values)
+        return Annotated._as_annotated_instance(self, values)  # type: ignore
 
-    def _with_annotations(self, values: _AnnotationDict) -> Annotated:
+    def _with_annotations(
+        self: SelfSupportsAnnotations, values: _AnnotationDict
+    ) -> SelfSupportsAnnotations:
         """return a copy of this ClauseElement with annotations
         replaced by the given dictionary.
 
         """
-        return Annotated._as_annotated_instance(self, values)
+        return Annotated._as_annotated_instance(self, values)  # type: ignore
 
     @overload
     def _deannotate(
@@ -251,7 +257,7 @@ class Annotated(SupportsAnnotations):
     """clones a SupportsAnnotations and applies an 'annotations' dictionary.
 
     Unlike regular clones, this clone also mimics __hash__() and
-    __cmp__() of the original element so that it takes its place
+    __eq__() of the original element so that it takes its place
     in hashed collections.
 
     A reference to the original element is maintained, for the important
@@ -300,16 +306,17 @@ class Annotated(SupportsAnnotations):
         self: SelfAnnotated, values: _AnnotationDict
     ) -> SelfAnnotated:
         _values = self._annotations.union(values)
-        return self._with_annotations(_values)
+        new: SelfAnnotated = self._with_annotations(_values)  # type: ignore
+        return new
 
     def _with_annotations(
-        self: SelfAnnotated, values: util.immutabledict[str, Any]
-    ) -> SelfAnnotated:
+        self: SelfAnnotated, values: _AnnotationDict
+    ) -> SupportsAnnotations:
         clone = self.__class__.__new__(self.__class__)
         clone.__dict__ = self.__dict__.copy()
         clone.__dict__.pop("_annotations_cache_key", None)
         clone.__dict__.pop("_generate_cache_key", None)
-        clone._annotations = values
+        clone._annotations = util.immutabledict(values)
         return clone
 
     @overload
@@ -380,8 +387,8 @@ class Annotated(SupportsAnnotations):
         else:
             return hash(other) == hash(self)
 
-    @property
-    def entity_namespace(self) -> Mapping[str, Any]:
+    @util.ro_non_memoized_property
+    def entity_namespace(self) -> _EntityNamespace:
         if "entity_namespace" in self._annotations:
             return cast(
                 SupportsWrappingAnnotations,
@@ -451,9 +458,23 @@ def _deep_annotate(
     return element
 
 
+@overload
+def _deep_deannotate(
+    element: Literal[None], values: Optional[Sequence[str]] = None
+) -> Literal[None]:
+    ...
+
+
+@overload
 def _deep_deannotate(
     element: _SA, values: Optional[Sequence[str]] = None
 ) -> _SA:
+    ...
+
+
+def _deep_deannotate(
+    element: Optional[_SA], values: Optional[Sequence[str]] = None
+) -> Optional[_SA]:
     """Deep copy the given element, removing annotations."""
 
     cloned: Dict[Any, SupportsAnnotations] = {}
@@ -479,9 +500,7 @@ def _deep_deannotate(
     return element
 
 
-def _shallow_annotate(
-    element: SupportsAnnotations, annotations: _AnnotationDict
-) -> SupportsAnnotations:
+def _shallow_annotate(element: _SA, annotations: _AnnotationDict) -> _SA:
     """Annotate the given ClauseElement and copy its internals so that
     internal objects refer to the new annotated object.
 

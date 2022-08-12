@@ -179,6 +179,7 @@ purposes.
 
 .. rst-class:: core-header
 
+.. _tutorial_statement_execution:
 
 Basics of Statement Execution
 -----------------------------
@@ -270,7 +271,7 @@ Below we illustrate a variety of ways to access rows.
           y = row.y
 
           # illustrate use with Python f-strings
-          print(f"Row: {row.x} {row.y}")
+          print(f"Row: {row.x} {y}")
 
   ..
 

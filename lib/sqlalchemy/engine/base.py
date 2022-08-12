@@ -12,15 +12,16 @@ import typing
 from typing import Any
 from typing import Callable
 from typing import cast
-from typing import Dict
 from typing import Iterator
 from typing import List
 from typing import Mapping
 from typing import MutableMapping
 from typing import NoReturn
 from typing import Optional
+from typing import overload
 from typing import Tuple
 from typing import Type
+from typing import TypeVar
 from typing import Union
 
 from .interfaces import _IsolationLevel
@@ -42,16 +43,14 @@ from ..sql import util as sql_util
 _CompiledCacheType = MutableMapping[Any, "Compiled"]
 
 if typing.TYPE_CHECKING:
-    from . import Result
+    from . import CursorResult
     from . import ScalarResult
     from .interfaces import _AnyExecuteParams
     from .interfaces import _AnyMultiExecuteParams
-    from .interfaces import _AnySingleExecuteParams
     from .interfaces import _CoreAnyExecuteParams
     from .interfaces import _CoreMultiExecuteParams
     from .interfaces import _CoreSingleExecuteParams
     from .interfaces import _DBAPIAnyExecuteParams
-    from .interfaces import _DBAPIMultiExecuteParams
     from .interfaces import _DBAPISingleExecuteParams
     from .interfaces import _ExecuteOptions
     from .interfaces import _ExecuteOptionsParameter
@@ -65,42 +64,45 @@ if typing.TYPE_CHECKING:
     from ..pool import Pool
     from ..pool import PoolProxiedConnection
     from ..sql import Executable
-    from ..sql.base import SchemaVisitor
+    from ..sql._typing import _InfoType
     from ..sql.compiler import Compiled
-    from ..sql.ddl import DDLElement
+    from ..sql.ddl import ExecutableDDLElement
     from ..sql.ddl import SchemaDropper
     from ..sql.ddl import SchemaGenerator
     from ..sql.functions import FunctionElement
-    from ..sql.schema import ColumnDefault
+    from ..sql.schema import DefaultGenerator
     from ..sql.schema import HasSchemaAttr
+    from ..sql.schema import SchemaItem
+    from ..sql.selectable import TypedReturnsRows
 
 """Defines :class:`_engine.Connection` and :class:`_engine.Engine`.
 
 """
 
-_EMPTY_EXECUTION_OPTS: _ExecuteOptions = util.immutabledict()
-NO_OPTIONS: Mapping[str, Any] = util.immutabledict()
+_T = TypeVar("_T", bound=Any)
+_EMPTY_EXECUTION_OPTS: _ExecuteOptions = util.EMPTY_DICT
+NO_OPTIONS: Mapping[str, Any] = util.EMPTY_DICT
 
 
 class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
     """Provides high-level functionality for a wrapped DB-API connection.
 
-    The :class:`_engine.Connection` object is procured by calling
-    the :meth:`_engine.Engine.connect` method of the :class:`_engine.Engine`
+    The :class:`_engine.Connection` object is procured by calling the
+    :meth:`_engine.Engine.connect` method of the :class:`_engine.Engine`
     object, and provides services for execution of SQL statements as well
     as transaction control.
 
-    The Connection object is **not** thread-safe.  While a Connection can be
+    The Connection object is **not** thread-safe. While a Connection can be
     shared among threads using properly synchronized access, it is still
     possible that the underlying DBAPI connection may not support shared
-    access between threads.  Check the DBAPI documentation for details.
+    access between threads. Check the DBAPI documentation for details.
 
     The Connection object represents a single DBAPI connection checked out
-    from the connection pool. In this state, the connection pool has no affect
-    upon the connection, including its expiration or timeout state. For the
-    connection pool to properly manage connections, connections should be
-    returned to the connection pool (i.e. ``connection.close()``) whenever the
-    connection is not in use.
+    from the connection pool. In this state, the connection pool has no
+    affect upon the connection, including its expiration or timeout state.
+    For the connection pool to properly manage connections, connections
+    should be returned to the connection pool (i.e. ``connection.close()``)
+    whenever the connection is not in use.
 
     .. index::
       single: thread safety; Connection
@@ -141,7 +143,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         if connection is None:
             try:
                 self._dbapi_connection = engine.raw_connection()
-            except dialect.dbapi.Error as err:
+            except dialect.loaded_dbapi.Error as err:
                 Connection._handle_dbapi_exception_noconnection(
                     err, dialect, engine
                 )
@@ -185,8 +187,8 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         if fmt:
             message = fmt(message)
 
-        if util.py38:
-            kw["stacklevel"] = 2
+        if log.STACKLEVEL:
+            kw["stacklevel"] = 1 + log.STACKLEVEL_OFFSET
 
         self.engine.logger.info(message, *arg, **kw)
 
@@ -196,8 +198,8 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         if fmt:
             message = fmt(message)
 
-        if util.py38:
-            kw["stacklevel"] = 2
+        if log.STACKLEVEL:
+            kw["stacklevel"] = 1 + log.STACKLEVEL_OFFSET
 
         self.engine.logger.debug(message, *arg, **kw)
 
@@ -356,14 +358,85 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
           :class:`_sql.Executable`.
 
           Indicate to the dialect that results should be
-          "streamed" and not pre-buffered, if possible.  This is a limitation
-          of many DBAPIs.  The flag is currently understood within a subset
-          of dialects within the PostgreSQL and MySQL categories, and
-          may be supported by other third party dialects as well.
+          "streamed" and not pre-buffered, if possible.  For backends
+          such as PostgreSQL, MySQL and MariaDB, this indicates the use of
+          a "server side cursor" as opposed to a client side cursor.
+          Other backends such as that of Oracle may already use server
+          side cursors by default.
+
+          The usage of
+          :paramref:`_engine.Connection.execution_options.stream_results` is
+          usually combined with setting a fixed number of rows to to be fetched
+          in batches, to allow for efficient iteration of database rows while
+          at the same time not loading all result rows into memory at once;
+          this can be configured on a :class:`_engine.Result` object using the
+          :meth:`_engine.Result.yield_per` method, after execution has
+          returned a new :class:`_engine.Result`.   If
+          :meth:`_engine.Result.yield_per` is not used,
+          the :paramref:`_engine.Connection.execution_options.stream_results`
+          mode of operation will instead use a dynamically sized buffer
+          which buffers sets of rows at a time, growing on each batch
+          based on a fixed growth size up until a limit which may
+          be configured using the
+          :paramref:`_engine.Connection.execution_options.max_row_buffer`
+          parameter.
+
+          When using the ORM to fetch ORM mapped objects from a result,
+          :meth:`_engine.Result.yield_per` should always be used with
+          :paramref:`_engine.Connection.execution_options.stream_results`,
+          so that the ORM does not fetch all rows into new ORM objects at once.
+
+          For typical use, the
+          :paramref:`_engine.Connection.execution_options.yield_per` execution
+          option should be preferred, which sets up both
+          :paramref:`_engine.Connection.execution_options.stream_results` and
+          :meth:`_engine.Result.yield_per` at once. This option is supported
+          both at a core level by :class:`_engine.Connection` as well as by the
+          ORM :class:`_engine.Session`; the latter is described at
+          :ref:`orm_queryguide_yield_per`.
 
           .. seealso::
 
+            :ref:`engine_stream_results` - background on
+            :paramref:`_engine.Connection.execution_options.stream_results`
+
+            :paramref:`_engine.Connection.execution_options.max_row_buffer`
+
+            :paramref:`_engine.Connection.execution_options.yield_per`
+
+            :ref:`orm_queryguide_yield_per` - in the :ref:`queryguide_toplevel`
+            describing the ORM version of ``yield_per``
+
+        :param max_row_buffer: Available on: :class:`_engine.Connection`,
+          :class:`_sql.Executable`.  Sets a maximum
+          buffer size to use when the
+          :paramref:`_engine.Connection.execution_options.stream_results`
+          execution option is used on a backend that supports server side
+          cursors.  The default value if not specified is 1000.
+
+          .. seealso::
+
+            :paramref:`_engine.Connection.execution_options.stream_results`
+
             :ref:`engine_stream_results`
+
+
+        :param yield_per: Available on: :class:`_engine.Connection`,
+          :class:`_sql.Executable`.  Integer value applied which will
+          set the :paramref:`_engine.Connection.execution_options.stream_results`
+          execution option and invoke :meth:`_engine.Result.yield_per`
+          automatically at once.  Allows equivalent functionality as
+          is present when using this parameter with the ORM.
+
+          .. versionadded:: 1.4.40
+
+          .. seealso::
+
+            :ref:`engine_stream_results` - background and examples
+            on using server side cursors with Core.
+
+            :ref:`orm_queryguide_yield_per` - in the :ref:`queryguide_toplevel`
+            describing the ORM version of ``yield_per``
 
         :param schema_translate_map: Available on: :class:`_engine.Connection`,
           :class:`_engine.Engine`, :class:`_sql.Executable`.
@@ -471,7 +544,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         else:
             return self._dbapi_connection
 
-    def get_isolation_level(self) -> str:
+    def get_isolation_level(self) -> _IsolationLevel:
         """Return the current isolation level assigned to this
         :class:`_engine.Connection`.
 
@@ -560,7 +633,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         raise exc.ResourceClosedError("This Connection is closed")
 
     @property
-    def info(self) -> Dict[str, Any]:
+    def info(self) -> _InfoType:
         """Info dictionary associated with the underlying DBAPI connection
         referred to by this :class:`_engine.Connection`, allowing user-defined
         data to be associated with the connection.
@@ -818,6 +891,8 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
             :meth:`_engine.Connection.begin`
 
+            :ref:`session_begin_nested` - ORM support for SAVEPOINT
+
         """
         if self._transaction is None:
             self._autobegin()
@@ -925,10 +1000,29 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         )
 
     def _is_autocommit_isolation(self) -> bool:
+        opt_iso = self._execution_options.get("isolation_level", None)
         return bool(
-            self._execution_options.get("isolation_level", None)
-            == "AUTOCOMMIT"
+            opt_iso == "AUTOCOMMIT"
+            or (
+                opt_iso is None
+                and self.engine.dialect._on_connect_isolation_level
+                == "AUTOCOMMIT"
+            )
         )
+
+    def _get_required_transaction(self) -> RootTransaction:
+        trans = self._transaction
+        if trans is None:
+            raise exc.InvalidRequestError("connection is not in a transaction")
+        return trans
+
+    def _get_required_nested_transaction(self) -> NestedTransaction:
+        trans = self._nested_transaction
+        if trans is None:
+            raise exc.InvalidRequestError(
+                "connection is not in a nested transaction"
+            )
+        return trans
 
     def get_transaction(self) -> Optional[RootTransaction]:
         """Return the current root transaction in progress, if any.
@@ -949,7 +1043,13 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
     def _begin_impl(self, transaction: RootTransaction) -> None:
         if self._echo:
-            self._log_info("BEGIN (implicit)")
+            if self._is_autocommit_isolation():
+                self._log_info(
+                    "BEGIN (implicit; DBAPI should not BEGIN due to "
+                    "autocommit mode)"
+                )
+            else:
+                self._log_info("BEGIN (implicit)")
 
         self.__in_begin = True
 
@@ -1115,10 +1215,31 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             self._dbapi_connection = None
         self.__can_reconnect = False
 
+    @overload
+    def scalar(
+        self,
+        statement: TypedReturnsRows[Tuple[_T]],
+        parameters: Optional[_CoreSingleExecuteParams] = None,
+        *,
+        execution_options: Optional[_ExecuteOptionsParameter] = None,
+    ) -> Optional[_T]:
+        ...
+
+    @overload
     def scalar(
         self,
         statement: Executable,
         parameters: Optional[_CoreSingleExecuteParams] = None,
+        *,
+        execution_options: Optional[_ExecuteOptionsParameter] = None,
+    ) -> Any:
+        ...
+
+    def scalar(
+        self,
+        statement: Executable,
+        parameters: Optional[_CoreSingleExecuteParams] = None,
+        *,
         execution_options: Optional[_ExecuteOptionsParameter] = None,
     ) -> Any:
         r"""Executes a SQL statement construct and returns a scalar object.
@@ -1131,14 +1252,45 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
          first row returned.
 
         """
-        return self.execute(statement, parameters, execution_options).scalar()
+        distilled_parameters = _distill_params_20(parameters)
+        try:
+            meth = statement._execute_on_scalar
+        except AttributeError as err:
+            raise exc.ObjectNotExecutableError(statement) from err
+        else:
+            return meth(
+                self,
+                distilled_parameters,
+                execution_options or NO_OPTIONS,
+            )
+
+    @overload
+    def scalars(
+        self,
+        statement: TypedReturnsRows[Tuple[_T]],
+        parameters: Optional[_CoreSingleExecuteParams] = None,
+        *,
+        execution_options: Optional[_ExecuteOptionsParameter] = None,
+    ) -> ScalarResult[_T]:
+        ...
+
+    @overload
+    def scalars(
+        self,
+        statement: Executable,
+        parameters: Optional[_CoreSingleExecuteParams] = None,
+        *,
+        execution_options: Optional[_ExecuteOptionsParameter] = None,
+    ) -> ScalarResult[Any]:
+        ...
 
     def scalars(
         self,
         statement: Executable,
         parameters: Optional[_CoreSingleExecuteParams] = None,
+        *,
         execution_options: Optional[_ExecuteOptionsParameter] = None,
-    ) -> ScalarResult:
+    ) -> ScalarResult[Any]:
         """Executes and returns a scalar result set, which yields scalar values
         from the first column of each row.
 
@@ -1153,16 +1305,39 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
         """
 
-        return self.execute(statement, parameters, execution_options).scalars()
+        return self.execute(
+            statement, parameters, execution_options=execution_options
+        ).scalars()
+
+    @overload
+    def execute(
+        self,
+        statement: TypedReturnsRows[_T],
+        parameters: Optional[_CoreAnyExecuteParams] = None,
+        *,
+        execution_options: Optional[_ExecuteOptionsParameter] = None,
+    ) -> CursorResult[_T]:
+        ...
+
+    @overload
+    def execute(
+        self,
+        statement: Executable,
+        parameters: Optional[_CoreAnyExecuteParams] = None,
+        *,
+        execution_options: Optional[_ExecuteOptionsParameter] = None,
+    ) -> CursorResult[Any]:
+        ...
 
     def execute(
         self,
         statement: Executable,
         parameters: Optional[_CoreAnyExecuteParams] = None,
+        *,
         execution_options: Optional[_ExecuteOptionsParameter] = None,
-    ) -> Result:
+    ) -> CursorResult[Any]:
         r"""Executes a SQL statement construct and returns a
-        :class:`_engine.Result`.
+        :class:`_engine.CursorResult`.
 
         :param statement: The statement to be executed.  This is always
          an object that is in both the :class:`_expression.ClauseElement` and
@@ -1174,7 +1349,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
          * :class:`_expression.TextClause` and
            :class:`_expression.TextualSelect`
          * :class:`_schema.DDL` and objects which inherit from
-           :class:`_schema.DDLElement`
+           :class:`_schema.ExecutableDDLElement`
 
         :param parameters: parameters which will be bound into the statement.
          This may be either a dictionary of parameter names to values,
@@ -1208,8 +1383,8 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         self,
         func: FunctionElement[Any],
         distilled_parameters: _CoreMultiExecuteParams,
-        execution_options: _ExecuteOptions,
-    ) -> Result:
+        execution_options: _ExecuteOptionsParameter,
+    ) -> CursorResult[Any]:
         """Execute a sql.FunctionElement object."""
 
         return self._execute_clauseelement(
@@ -1218,9 +1393,9 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
     def _execute_default(
         self,
-        default: ColumnDefault,
+        default: DefaultGenerator,
         distilled_parameters: _CoreMultiExecuteParams,
-        execution_options: _ExecuteOptions,
+        execution_options: _ExecuteOptionsParameter,
     ) -> Any:
         """Execute a schema.ColumnDefault object."""
 
@@ -1277,10 +1452,10 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
     def _execute_ddl(
         self,
-        ddl: DDLElement,
+        ddl: ExecutableDDLElement,
         distilled_parameters: _CoreMultiExecuteParams,
-        execution_options: _ExecuteOptions,
-    ) -> Result:
+        execution_options: _ExecuteOptionsParameter,
+    ) -> CursorResult[Any]:
         """Execute a schema.DDL object."""
 
         execution_options = ddl._execution_options.merge_with(
@@ -1376,8 +1551,8 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         self,
         elem: Executable,
         distilled_parameters: _CoreMultiExecuteParams,
-        execution_options: _ExecuteOptions,
-    ) -> Result:
+        execution_options: _ExecuteOptionsParameter,
+    ) -> CursorResult[Any]:
         """Execute a sql.ClauseElement object."""
 
         execution_options = elem._execution_options.merge_with(
@@ -1450,7 +1625,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         compiled: Compiled,
         distilled_parameters: _CoreMultiExecuteParams,
         execution_options: _ExecuteOptionsParameter = _EMPTY_EXECUTION_OPTS,
-    ) -> Result:
+    ) -> CursorResult[Any]:
         """Execute a sql.Compiled object.
 
         TODO: why do we have this?   likely deprecate or remove
@@ -1499,8 +1674,8 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         self,
         statement: str,
         parameters: Optional[_DBAPIAnyExecuteParams] = None,
-        execution_options: Optional[_ExecuteOptions] = None,
-    ) -> Result:
+        execution_options: Optional[_ExecuteOptionsParameter] = None,
+    ) -> CursorResult[Any]:
         r"""Executes a SQL statement construct and returns a
         :class:`_engine.CursorResult`.
 
@@ -1577,10 +1752,16 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         execution_options: _ExecuteOptions,
         *args: Any,
         **kw: Any,
-    ) -> Result:
+    ) -> CursorResult[Any]:
         """Create an :class:`.ExecutionContext` and execute, returning
         a :class:`_engine.CursorResult`."""
 
+        if execution_options:
+            yp = execution_options.get("yield_per", None)
+            if yp:
+                execution_options = execution_options.union(
+                    {"stream_results": True, "max_row_buffer": yp}
+                )
         try:
             conn = self._dbapi_connection
             if conn is None:
@@ -1809,7 +1990,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
         if not self._is_disconnect:
             self._is_disconnect = (
-                isinstance(e, self.dialect.dbapi.Error)
+                isinstance(e, self.dialect.loaded_dbapi.Error)
                 and not self.closed
                 and self.dialect.is_disconnect(
                     e,
@@ -1825,7 +2006,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
                 statement,
                 parameters,
                 e,
-                self.dialect.dbapi.Error,
+                self.dialect.loaded_dbapi.Error,
                 hide_parameters=self.engine.hide_parameters,
                 dialect=self.dialect,
                 ismulti=context.executemany if context is not None else None,
@@ -1834,7 +2015,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         try:
             # non-DBAPI error - if we already got a context,
             # or there's no string statement, don't wrap it
-            should_wrap = isinstance(e, self.dialect.dbapi.Error) or (
+            should_wrap = isinstance(e, self.dialect.loaded_dbapi.Error) or (
                 statement is not None
                 and context is None
                 and not is_exit_exception
@@ -1845,7 +2026,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
                     statement,
                     parameters,
                     cast(Exception, e),
-                    self.dialect.dbapi.Error,
+                    self.dialect.loaded_dbapi.Error,
                     hide_parameters=self.engine.hide_parameters,
                     connection_invalidated=self._is_disconnect,
                     dialect=self.dialect,
@@ -1858,15 +2039,14 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
             newraise = None
 
-            if (
-                self._has_events or self.engine._has_events
-            ) and not self._execution_options.get(
+            if (self.dialect._has_events) and not self._execution_options.get(
                 "skip_user_error_events", False
             ):
                 ctx = ExceptionContextImpl(
                     e,
                     sqlalchemy_exception,
                     self.engine,
+                    self.dialect,
                     self,
                     cursor,
                     statement,
@@ -1876,7 +2056,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
                     invalidate_pool_on_disconnect,
                 )
 
-                for fn in self.dispatch.handle_error:
+                for fn in self.dialect.dispatch.handle_error:
                     try:
                         # handler returns an exception;
                         # call next handler in a chain
@@ -1938,44 +2118,54 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
     @classmethod
     def _handle_dbapi_exception_noconnection(
-        cls, e: BaseException, dialect: Dialect, engine: Engine
+        cls,
+        e: BaseException,
+        dialect: Dialect,
+        engine: Optional[Engine] = None,
+        is_disconnect: Optional[bool] = None,
+        invalidate_pool_on_disconnect: bool = True,
     ) -> NoReturn:
         exc_info = sys.exc_info()
 
-        is_disconnect = isinstance(
-            e, dialect.dbapi.Error
-        ) and dialect.is_disconnect(e, None, None)
+        if is_disconnect is None:
+            is_disconnect = isinstance(
+                e, dialect.loaded_dbapi.Error
+            ) and dialect.is_disconnect(e, None, None)
 
-        should_wrap = isinstance(e, dialect.dbapi.Error)
+        should_wrap = isinstance(e, dialect.loaded_dbapi.Error)
 
         if should_wrap:
             sqlalchemy_exception = exc.DBAPIError.instance(
                 None,
                 None,
                 cast(Exception, e),
-                dialect.dbapi.Error,
-                hide_parameters=engine.hide_parameters,
+                dialect.loaded_dbapi.Error,
+                hide_parameters=engine.hide_parameters
+                if engine is not None
+                else False,
                 connection_invalidated=is_disconnect,
+                dialect=dialect,
             )
         else:
             sqlalchemy_exception = None
 
         newraise = None
 
-        if engine._has_events:
+        if dialect._has_events:
             ctx = ExceptionContextImpl(
                 e,
                 sqlalchemy_exception,
                 engine,
+                dialect,
                 None,
                 None,
                 None,
                 None,
                 None,
                 is_disconnect,
-                True,
+                invalidate_pool_on_disconnect,
             )
-            for fn in engine.dispatch.handle_error:
+            for fn in dialect.dispatch.handle_error:
                 try:
                     # handler returns an exception;
                     # call next handler in a chain
@@ -2004,7 +2194,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
     def _run_ddl_visitor(
         self,
         visitorcallable: Type[Union[SchemaGenerator, SchemaDropper]],
-        element: DDLElement,
+        element: SchemaItem,
         **kwargs: Any,
     ) -> None:
         """run a DDL visitor.
@@ -2019,11 +2209,27 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 class ExceptionContextImpl(ExceptionContext):
     """Implement the :class:`.ExceptionContext` interface."""
 
+    __slots__ = (
+        "connection",
+        "engine",
+        "dialect",
+        "cursor",
+        "statement",
+        "parameters",
+        "original_exception",
+        "sqlalchemy_exception",
+        "chained_exception",
+        "execution_context",
+        "is_disconnect",
+        "invalidate_pool_on_disconnect",
+    )
+
     def __init__(
         self,
         exception: BaseException,
         sqlalchemy_exception: Optional[exc.StatementError],
         engine: Optional[Engine],
+        dialect: Dialect,
         connection: Optional[Connection],
         cursor: Optional[DBAPICursor],
         statement: Optional[str],
@@ -2033,6 +2239,7 @@ class ExceptionContextImpl(ExceptionContext):
         invalidate_pool_on_disconnect: bool,
     ):
         self.engine = engine
+        self.dialect = dialect
         self.connection = connection
         self.sqlalchemy_exception = sqlalchemy_exception
         self.original_exception = exception
@@ -2529,6 +2736,12 @@ class Engine(
 
     @property
     def engine(self) -> Engine:
+        """Returns this :class:`.Engine`.
+
+        Used for legacy schemes that accept :class:`.Connection` /
+        :class:`.Engine` objects within the same variable.
+
+        """
         return self
 
     def clear_compiled_cache(self) -> None:
@@ -2643,7 +2856,7 @@ class Engine(
             :meth:`_engine.Engine.get_execution_options`
 
 
-        """  # noqa E501
+        """  # noqa: E501
         return self._option_cls(self, opt)
 
     def get_execution_options(self) -> _ExecuteOptions:
@@ -2660,14 +2873,18 @@ class Engine(
     @property
     def name(self) -> str:
         """String name of the :class:`~sqlalchemy.engine.interfaces.Dialect`
-        in use by this :class:`Engine`."""
+        in use by this :class:`Engine`.
+
+        """
 
         return self.dialect.name
 
     @property
     def driver(self) -> str:
         """Driver name of the :class:`~sqlalchemy.engine.interfaces.Dialect`
-        in use by this :class:`Engine`."""
+        in use by this :class:`Engine`.
+
+        """
 
         return self.dialect.driver
 
@@ -2676,32 +2893,45 @@ class Engine(
     def __repr__(self) -> str:
         return "Engine(%r)" % (self.url,)
 
-    def dispose(self) -> None:
+    def dispose(self, close: bool = True) -> None:
         """Dispose of the connection pool used by this
         :class:`_engine.Engine`.
 
-        This has the effect of fully closing all **currently checked in**
-        database connections.  Connections that are still checked out
-        will **not** be closed, however they will no longer be associated
-        with this :class:`_engine.Engine`,
-        so when they are closed individually,
-        eventually the :class:`_pool.Pool` which they are associated with will
-        be garbage collected and they will be closed out fully, if
-        not already closed on checkin.
+        A new connection pool is created immediately after the old one has been
+        disposed. The previous connection pool is disposed either actively, by
+        closing out all currently checked-in connections in that pool, or
+        passively, by losing references to it but otherwise not closing any
+        connections. The latter strategy is more appropriate for an initializer
+        in a forked Python process.
 
-        A new connection pool is created immediately after the old one has
-        been disposed.   This new pool, like all SQLAlchemy connection pools,
-        does not make any actual connections to the database until one is
-        first requested, so as long as the :class:`_engine.Engine`
-        isn't used again,
-        no new connections will be made.
+        :param close: if left at its default of ``True``, has the
+         effect of fully closing all **currently checked in**
+         database connections.  Connections that are still checked out
+         will **not** be closed, however they will no longer be associated
+         with this :class:`_engine.Engine`,
+         so when they are closed individually, eventually the
+         :class:`_pool.Pool` which they are associated with will
+         be garbage collected and they will be closed out fully, if
+         not already closed on checkin.
+
+         If set to ``False``, the previous connection pool is de-referenced,
+         and otherwise not touched in any way.
+
+        .. versionadded:: 1.4.33  Added the :paramref:`.Engine.dispose.close`
+            parameter to allow the replacement of a connection pool in a child
+            process without interfering with the connections used by the parent
+            process.
+
 
         .. seealso::
 
             :ref:`engine_disposal`
 
+            :ref:`pooling_multiprocessing`
+
         """
-        self.pool.dispose()
+        if close:
+            self.pool.dispose()
         self.pool = self.pool.recreate()
         self.dispatch.engine_disposed(self)
 
@@ -2749,7 +2979,7 @@ class Engine(
     def _run_ddl_visitor(
         self,
         visitorcallable: Type[Union[SchemaGenerator, SchemaDropper]],
-        element: DDLElement,
+        element: SchemaItem,
         **kwargs: Any,
     ) -> None:
         with self.begin() as conn:

@@ -863,6 +863,8 @@ class ConstraintCompilationTest(fixtures.TestBase, AssertsCompiledSQL):
             x.append_constraint(idx)
             self.assert_compile(schema.CreateIndex(idx), ddl)
 
+            x.to_metadata(MetaData())
+
     def test_index_against_text_separate(self):
         metadata = MetaData()
         idx = Index("y", text("some_function(q)"))
@@ -1257,6 +1259,16 @@ class ConstraintCompilationTest(fixtures.TestBase, AssertsCompiledSQL):
         self.assert_compile(
             schema.DropConstraint(constraint, cascade=True),
             "ALTER TABLE tbl DROP CONSTRAINT my_test_constraint CASCADE",
+        )
+
+    def test_render_drop_constraint_if_exists(self):
+        t, t2 = self._constraint_create_fixture()
+
+        constraint = CheckConstraint("a = 1", name="a1", table=t)
+
+        self.assert_compile(
+            schema.DropConstraint(constraint, if_exists=True),
+            "ALTER TABLE tbl DROP CONSTRAINT IF EXISTS a1",
         )
 
     def test_render_add_fk_constraint_stringcol(self):

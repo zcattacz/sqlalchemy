@@ -4,6 +4,7 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: allow-untyped-defs, allow-untyped-calls
 
 """Routines to help with the creation, loading and introspection of
 modules, classes, hierarchies, attributes, functions, and methods.
@@ -12,17 +13,18 @@ modules, classes, hierarchies, attributes, functions, and methods.
 from __future__ import annotations
 
 import collections
+import enum
 from functools import update_wrapper
 import hashlib
 import inspect
 import itertools
 import operator
+import os
 import re
 import sys
 import textwrap
 import threading
 import types
-import typing
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -32,6 +34,7 @@ from typing import Generic
 from typing import Iterator
 from typing import List
 from typing import Mapping
+from typing import no_type_check
 from typing import NoReturn
 from typing import Optional
 from typing import overload
@@ -46,8 +49,8 @@ import warnings
 
 from . import _collections
 from . import compat
-from . import typing as compat_typing
 from ._has_cy import HAS_CYEXTENSION
+from .typing import Literal
 from .. import exc
 
 _T = TypeVar("_T")
@@ -55,8 +58,8 @@ _T_co = TypeVar("_T_co", covariant=True)
 _F = TypeVar("_F", bound=Callable[..., Any])
 _MP = TypeVar("_MP", bound="memoized_property[Any]")
 _MA = TypeVar("_MA", bound="HasMemoized.memoized_attribute[Any]")
-_HP = TypeVar("_HP", bound="hybridproperty")
-_HM = TypeVar("_HM", bound="hybridmethod")
+_HP = TypeVar("_HP", bound="hybridproperty[Any]")
+_HM = TypeVar("_HM", bound="hybridmethod[Any]")
 
 
 if compat.py310:
@@ -106,10 +109,12 @@ class safe_reraise:
             with safe_reraise():
                 sess.rollback()
 
-    TODO: is this context manager getting us anything in Python 3?
-    Not sure of the coroutine issue stated above; we would assume this was
-    when using eventlet / gevent.  not sure if our own greenlet integration
-    is impacted.
+    TODO: we should at some point evaluate current behaviors in this regard
+    based on current greenlet, gevent/eventlet implementations in Python 3, and
+    also see the degree to which our own asyncio (based on greenlet also) is
+    impacted by this. .rollback() will cause IO / context switch to occur in
+    all these scenarios; what happens to the exception context from an
+    "except:" block if we don't explicitly store it? Original issue was #2703.
 
     """
 
@@ -178,7 +183,8 @@ def clsname_as_plain_name(cls: Type[Any]) -> str:
 
 
 def method_is_overridden(
-    instance_or_cls: Union[Type[Any], object], against_method: types.MethodType
+    instance_or_cls: Union[Type[Any], object],
+    against_method: Callable[..., Any],
 ) -> bool:
     """Return True if the two class methods don't match."""
 
@@ -233,18 +239,15 @@ def map_bits(fn: Callable[[int], Any], n: int) -> Iterator[Any]:
         n ^= b
 
 
-_Fn = typing.TypeVar("_Fn", bound=typing.Callable[..., Any])
-_Args = compat_typing.ParamSpec("_Args")
+_Fn = TypeVar("_Fn", bound="Callable[..., Any]")
+
+# this seems to be in flux in recent mypy versions
 
 
-def decorator(
-    target: typing.Callable[  # type: ignore
-        compat_typing.Concatenate[_Fn, _Args], typing.Any
-    ]
-) -> _Fn:
+def decorator(target: Callable[..., Any]) -> Callable[[_Fn], _Fn]:
     """A signature-matching decorator factory."""
 
-    def decorate(fn: typing.Callable[..., Any]) -> typing.Callable[..., Any]:
+    def decorate(fn: _Fn) -> _Fn:
         if not inspect.isfunction(fn) and not inspect.ismethod(fn):
             raise Exception("not a decoratable function")
 
@@ -263,13 +266,31 @@ def decorator(
         metadata: Dict[str, Optional[str]] = dict(target=targ_name, fn=fn_name)
         metadata.update(format_argspec_plus(spec, grouped=False))
         metadata["name"] = fn.__name__
-        code = (
-            """\
+
+        # look for __ positional arguments.  This is a convention in
+        # SQLAlchemy that arguments should be passed positionally
+        # rather than as keyword
+        # arguments.  note that apply_pos doesn't currently work in all cases
+        # such as when a kw-only indicator "*" is present, which is why
+        # we limit the use of this to just that case we can detect.  As we add
+        # more kinds of methods that use @decorator, things may have to
+        # be further improved in this area
+        if "__" in repr(spec[0]):
+            code = (
+                """\
+def %(name)s%(grouped_args)s:
+    return %(target)s(%(fn)s, %(apply_pos)s)
+"""
+                % metadata
+            )
+        else:
+            code = (
+                """\
 def %(name)s%(grouped_args)s:
     return %(target)s(%(fn)s, %(apply_kw)s)
 """
-            % metadata
-        )
+                % metadata
+            )
         env.update({targ_name: target, fn_name: fn, "__name__": fn.__module__})
 
         decorated = cast(
@@ -278,12 +299,10 @@ def %(name)s%(grouped_args)s:
         )
         decorated.__defaults__ = getattr(fn, "__func__", fn).__defaults__
 
-        # claims to be fixed?
-        # https://github.com/python/mypy/issues/11896
         decorated.__wrapped__ = fn  # type: ignore
-        return update_wrapper(decorated, fn)
+        return cast(_Fn, update_wrapper(decorated, fn))
 
-    return typing.cast(_Fn, update_wrapper(decorate, target))
+    return update_wrapper(decorate, target)
 
 
 def _update_argspec_defaults_into_env(spec, env):
@@ -316,8 +335,6 @@ def _exec_code_in_env(
 
 _PF = TypeVar("_PF")
 _TE = TypeVar("_TE")
-
-_P = compat_typing.ParamSpec("_P")
 
 
 class PluginLoader:
@@ -385,7 +402,7 @@ def get_cls_kwargs(
     cls: type,
     *,
     _set: Optional[Set[str]] = None,
-    raiseerr: compat_typing.Literal[True] = ...,
+    raiseerr: Literal[True] = ...,
 ) -> Set[str]:
     ...
 
@@ -507,7 +524,7 @@ def get_callable_argspec(
             fn.__init__, no_self=no_self, _is_init=True
         )
     elif hasattr(fn, "__func__"):
-        return compat.inspect_getfullargspec(fn.__func__)  # type: ignore[attr-defined] # noqa E501
+        return compat.inspect_getfullargspec(fn.__func__)  # type: ignore[attr-defined] # noqa: E501
     elif hasattr(fn, "__call__"):
         if inspect.ismethod(fn.__call__):  # type: ignore [operator]
             return get_callable_argspec(
@@ -668,118 +685,24 @@ def format_argspec_init(method, grouped=True):
 
 
 def create_proxy_methods(
-    target_cls,
-    target_cls_sphinx_name,
-    proxy_cls_sphinx_name,
-    classmethods=(),
-    methods=(),
-    attributes=(),
-):
-    """A class decorator that will copy attributes to a proxy class.
+    target_cls: Type[Any],
+    target_cls_sphinx_name: str,
+    proxy_cls_sphinx_name: str,
+    classmethods: Sequence[str] = (),
+    methods: Sequence[str] = (),
+    attributes: Sequence[str] = (),
+) -> Callable[[_T], _T]:
+    """A class decorator indicating attributes should refer to a proxy
+    class.
 
-    The class to be instrumented must define a single accessor "_proxied".
+    This decorator is now a "marker" that does nothing at runtime.  Instead,
+    it is consumed by the tools/generate_proxy_methods.py script to
+    statically generate proxy methods and attributes that are fully
+    recognized by typing tools such as mypy.
 
     """
 
     def decorate(cls):
-        def instrument(name, clslevel=False):
-            fn = cast(types.FunctionType, getattr(target_cls, name))
-            spec = compat.inspect_getfullargspec(fn)
-            env = {"__name__": fn.__module__}
-
-            spec = _update_argspec_defaults_into_env(spec, env)
-            caller_argspec = format_argspec_plus(spec, grouped=False)
-
-            metadata = {
-                "name": fn.__name__,
-                "apply_pos_proxied": caller_argspec["apply_pos_proxied"],
-                "apply_kw_proxied": caller_argspec["apply_kw_proxied"],
-                "grouped_args": caller_argspec["grouped_args"],
-                "self_arg": caller_argspec["self_arg"],
-            }
-
-            if clslevel:
-                code = (
-                    "def %(name)s%(grouped_args)s:\n"
-                    "    return target_cls.%(name)s(%(apply_kw_proxied)s)"
-                    % metadata
-                )
-                env["target_cls"] = target_cls
-            else:
-                code = (
-                    "def %(name)s%(grouped_args)s:\n"
-                    "    return %(self_arg)s._proxied.%(name)s(%(apply_kw_proxied)s)"  # noqa E501
-                    % metadata
-                )
-
-            proxy_fn = cast(
-                types.FunctionType, _exec_code_in_env(code, env, fn.__name__)
-            )
-            proxy_fn.__defaults__ = getattr(fn, "__func__", fn).__defaults__
-            proxy_fn.__doc__ = inject_docstring_text(
-                fn.__doc__,
-                ".. container:: class_bases\n\n    "
-                "Proxied for the %s class on behalf of the %s class."
-                % (target_cls_sphinx_name, proxy_cls_sphinx_name),
-                1,
-            )
-
-            if clslevel:
-                return classmethod(proxy_fn)
-            else:
-                return proxy_fn
-
-        def makeprop(name):
-            attr = target_cls.__dict__.get(name, None)
-
-            if attr is not None:
-                doc = inject_docstring_text(
-                    attr.__doc__,
-                    ".. container:: class_bases\n\n    "
-                    "Proxied for the %s class on behalf of the %s class."
-                    % (
-                        target_cls_sphinx_name,
-                        proxy_cls_sphinx_name,
-                    ),
-                    1,
-                )
-            else:
-                doc = None
-
-            code = (
-                "def set_(self, attr):\n"
-                "    self._proxied.%(name)s = attr\n"
-                "def get(self):\n"
-                "    return self._proxied.%(name)s\n"
-                "get.__doc__ = doc\n"
-                "getset = property(get, set_)"
-            ) % {"name": name}
-
-            getset = _exec_code_in_env(code, {"doc": doc}, "getset")
-
-            return getset
-
-        for meth in methods:
-            if hasattr(cls, meth):
-                raise TypeError(
-                    "class %s already has a method %s" % (cls, meth)
-                )
-            setattr(cls, meth, instrument(meth))
-
-        for prop in attributes:
-            if hasattr(cls, prop):
-                raise TypeError(
-                    "class %s already has a method %s" % (cls, prop)
-                )
-            setattr(cls, prop, makeprop(prop))
-
-        for prop in classmethods:
-            if hasattr(cls, prop):
-                raise TypeError(
-                    "class %s already has a method %s" % (cls, prop)
-                )
-            setattr(cls, prop, instrument(prop, clslevel=True))
-
         return cls
 
     return decorate
@@ -815,7 +738,12 @@ def unbound_method_to_callable(func_or_cls):
         return func_or_cls
 
 
-def generic_repr(obj, additional_kw=(), to_inspect=None, omit_kwarg=()):
+def generic_repr(
+    obj: Any,
+    additional_kw: Sequence[Tuple[str, Any]] = (),
+    to_inspect: Optional[Union[object, List[object]]] = None,
+    omit_kwarg: Sequence[str] = (),
+) -> str:
     """Produce a __repr__() based on direct association of the __init__()
     specification vs. same-named attributes present.
 
@@ -1167,7 +1095,7 @@ class generic_fn_descriptor(Generic[_T_co]):
     def __get__(self: _GFD, obj: Any, cls: Any) -> Union[_GFD, _T_co]:
         raise NotImplementedError()
 
-    if typing.TYPE_CHECKING:
+    if TYPE_CHECKING:
 
         def __set__(self, instance: Any, value: Any) -> None:
             ...
@@ -1228,12 +1156,24 @@ class _memoized_property(generic_fn_descriptor[_T_co]):
 # superclass has non-memoized, the class hierarchy of the descriptors
 # would need to be reversed; "class non_memoized(memoized)".  so there's no
 # way to achieve this.
+# additional issues, RO properties:
+# https://github.com/python/mypy/issues/12440
 if TYPE_CHECKING:
+
+    # allow memoized and non-memoized to be freely mixed by having them
+    # be the same class
     memoized_property = generic_fn_descriptor
     non_memoized_property = generic_fn_descriptor
+
+    # for read only situations, mypy only sees @property as read only.
+    # read only is needed when a subtype specializes the return type
+    # of a property, meaning assignment needs to be disallowed
+    ro_memoized_property = property
+    ro_non_memoized_property = property
+
 else:
-    memoized_property = _memoized_property
-    non_memoized_property = _non_memoized_property
+    memoized_property = ro_memoized_property = _memoized_property
+    non_memoized_property = ro_non_memoized_property = _non_memoized_property
 
 
 def memoized_instancemethod(fn: _F) -> _F:
@@ -1265,7 +1205,7 @@ class HasMemoized:
 
     """
 
-    if not typing.TYPE_CHECKING:
+    if not TYPE_CHECKING:
         # support classes that want to have __slots__ with an explicit
         # slot for __dict__.  not sure if that requires base __slots__ here.
         __slots__ = ()
@@ -1285,7 +1225,11 @@ class HasMemoized:
         self._memoized_keys |= {key}
 
     class memoized_attribute(memoized_property[_T]):
-        """A read-only @property that is only evaluated once."""
+        """A read-only @property that is only evaluated once.
+
+        :meta private:
+
+        """
 
         fget: Callable[..., _T]
         __doc__: Optional[str]
@@ -1313,10 +1257,14 @@ class HasMemoized:
             return result
 
     @classmethod
-    def memoized_instancemethod(cls, fn: Any) -> Any:
-        """Decorate a method memoize its return value."""
+    def memoized_instancemethod(cls, fn: _F) -> _F:
+        """Decorate a method memoize its return value.
 
-        def oneshot(self, *args, **kw):
+        :meta private:
+
+        """
+
+        def oneshot(self: Any, *args: Any, **kw: Any) -> Any:
             result = fn(self, *args, **kw)
 
             def memo(*a, **kw):
@@ -1328,7 +1276,13 @@ class HasMemoized:
             self._memoized_keys |= {fn.__name__}
             return result
 
-        return update_wrapper(oneshot, fn)
+        return update_wrapper(oneshot, fn)  # type: ignore
+
+
+if TYPE_CHECKING:
+    HasMemoized_ro_memoized_attribute = property
+else:
+    HasMemoized_ro_memoized_attribute = HasMemoized.memoized_attribute
 
 
 class MemoizedSlots:
@@ -1344,17 +1298,20 @@ class MemoizedSlots:
     def _fallback_getattr(self, key):
         raise AttributeError(key)
 
-    def __getattr__(self, key):
+    def __getattr__(self, key: str) -> Any:
         if key.startswith("_memoized_attr_") or key.startswith(
             "_memoized_method_"
         ):
             raise AttributeError(key)
-        elif hasattr(self, "_memoized_attr_%s" % key):
-            value = getattr(self, "_memoized_attr_%s" % key)()
+        # to avoid recursion errors when interacting with other __getattr__
+        # schemes that refer to this one, when testing for memoized method
+        # look at __class__ only rather than going into __getattr__ again.
+        elif hasattr(self.__class__, f"_memoized_attr_{key}"):
+            value = getattr(self, f"_memoized_attr_{key}")()
             setattr(self, key, value)
             return value
-        elif hasattr(self, "_memoized_method_%s" % key):
-            fn = getattr(self, "_memoized_method_%s" % key)
+        elif hasattr(self.__class__, f"_memoized_method_{key}"):
+            fn = getattr(self, f"_memoized_method_{key}")
 
             def oneshot(*args, **kw):
                 result = fn(*args, **kw)
@@ -1509,14 +1466,16 @@ def duck_type_collection(
         return default
 
 
-def assert_arg_type(arg: Any, argtype: Type[Any], name: str) -> Any:
+def assert_arg_type(
+    arg: Any, argtype: Union[Tuple[Type[Any], ...], Type[Any]], name: str
+) -> Any:
     if isinstance(arg, argtype):
         return arg
     else:
         if isinstance(argtype, tuple):
             raise exc.ArgumentError(
                 "Argument '%s' is expected to be one of type %s, got '%s'"
-                % (name, " or ".join("'%s'" % a for a in argtype), type(arg))  # type: ignore  # noqa E501
+                % (name, " or ".join("'%s'" % a for a in argtype), type(arg))  # type: ignore  # noqa: E501
             )
         else:
             raise exc.ArgumentError(
@@ -1570,74 +1529,42 @@ class classproperty(property):
         return self.fget(cls)  # type: ignore
 
 
-class hybridproperty:
-    def __init__(self, func):
+class hybridproperty(Generic[_T]):
+    def __init__(self, func: Callable[..., _T]):
         self.func = func
         self.clslevel = func
 
-    def __get__(self, instance, owner):
+    def __get__(self, instance: Any, owner: Any) -> _T:
         if instance is None:
             clsval = self.clslevel(owner)
             return clsval
         else:
             return self.func(instance)
 
-    def classlevel(self, func):
+    def classlevel(self, func: Callable[..., Any]) -> hybridproperty[_T]:
         self.clslevel = func
         return self
 
 
-class hybridmethod:
+class hybridmethod(Generic[_T]):
     """Decorate a function as cls- or instance- level."""
 
-    def __init__(self, func):
+    def __init__(self, func: Callable[..., _T]):
         self.func = self.__func__ = func
         self.clslevel = func
 
-    def __get__(self, instance, owner):
+    def __get__(self, instance: Any, owner: Any) -> Callable[..., _T]:
         if instance is None:
-            return self.clslevel.__get__(owner, owner.__class__)
+            return self.clslevel.__get__(owner, owner.__class__)  # type:ignore
         else:
-            return self.func.__get__(instance, owner)
+            return self.func.__get__(instance, owner)  # type:ignore
 
-    def classlevel(self, func):
+    def classlevel(self, func: Callable[..., Any]) -> hybridmethod[_T]:
         self.clslevel = func
         return self
 
 
-class _symbol(int):
-    name: str
-
-    def __new__(
-        cls,
-        name: str,
-        doc: Optional[str] = None,
-        canonical: Optional[int] = None,
-    ) -> "_symbol":
-        """Construct a new named symbol."""
-        assert isinstance(name, str)
-        if canonical is None:
-            canonical = hash(name)
-        v = int.__new__(_symbol, canonical)
-        v.name = name
-        if doc:
-            v.__doc__ = doc
-        return v
-
-    def __reduce__(self):
-        return symbol, (self.name, "x", int(self))
-
-    def __str__(self):
-        return repr(self)
-
-    def __repr__(self):
-        return "symbol(%r)" % self.name
-
-
-_symbol.__name__ = "symbol"
-
-
-class symbol:
+class symbol(int):
     """A constant symbol.
 
     >>> symbol('foo') is symbol('foo')
@@ -1650,71 +1577,99 @@ class symbol:
 
     Repeated calls of symbol('name') will all return the same instance.
 
-    The optional ``doc`` argument assigns to ``__doc__``.  This
-    is strictly so that Sphinx autoattr picks up the docstring we want
-    (it doesn't appear to pick up the in-module docstring if the datamember
-    is in a different module - autoattribute also blows up completely).
-    If Sphinx fixes/improves this then we would no longer need
-    ``doc`` here.
+    In SQLAlchemy 2.0, symbol() is used for the implementation of
+    ``_FastIntFlag``, but otherwise should be mostly replaced by
+    ``enum.Enum`` and variants.
+
 
     """
 
-    symbols: Dict[str, "_symbol"] = {}
+    name: str
+
+    symbols: Dict[str, symbol] = {}
     _lock = threading.Lock()
 
-    def __new__(  # type: ignore[misc]
+    def __new__(
         cls,
         name: str,
         doc: Optional[str] = None,
         canonical: Optional[int] = None,
-    ) -> _symbol:
+    ) -> symbol:
         with cls._lock:
             sym = cls.symbols.get(name)
             if sym is None:
-                cls.symbols[name] = sym = _symbol(name, doc, canonical)
+                assert isinstance(name, str)
+                if canonical is None:
+                    canonical = hash(name)
+                sym = int.__new__(symbol, canonical)
+                sym.name = name
+                if doc:
+                    sym.__doc__ = doc
+
+                cls.symbols[name] = sym
             return sym
 
-    @classmethod
-    def parse_user_argument(
-        cls, arg, choices, name, resolve_symbol_names=False
-    ):
-        """Given a user parameter, parse the parameter into a chosen symbol.
+    def __reduce__(self):
+        return symbol, (self.name, "x", int(self))
 
-        The user argument can be a string name that matches the name of a
-        symbol, or the symbol object itself, or any number of alternate choices
-        such as True/False/ None etc.
+    def __str__(self):
+        return repr(self)
 
-        :param arg: the user argument.
-        :param choices: dictionary of symbol object to list of possible
-         entries.
-        :param name: name of the argument.   Used in an :class:`.ArgumentError`
-         that is raised if the parameter doesn't match any available argument.
-        :param resolve_symbol_names: include the name of each symbol as a valid
-         entry.
+    def __repr__(self):
+        return f"symbol({self.name!r})"
 
-        """
-        # note using hash lookup is tricky here because symbol's `__hash__`
-        # is its int value which we don't want included in the lookup
-        # explicitly, so we iterate and compare each.
-        for sym, choice in choices.items():
-            if arg is sym:
-                return sym
-            elif resolve_symbol_names and arg == sym.name:
-                return sym
-            elif arg in choice:
-                return sym
 
-        if arg is None:
-            return None
+class _IntFlagMeta(type):
+    def __init__(
+        cls,
+        classname: str,
+        bases: Tuple[Type[Any], ...],
+        dict_: Dict[str, Any],
+        **kw: Any,
+    ) -> None:
+        items: List[symbol]
+        cls._items = items = []
+        for k, v in dict_.items():
+            if isinstance(v, int):
+                sym = symbol(k, canonical=v)
+            elif not k.startswith("_"):
+                raise TypeError("Expected integer values for IntFlag")
+            else:
+                continue
+            setattr(cls, k, sym)
+            items.append(sym)
 
-        raise exc.ArgumentError("Invalid value for '%s': %r" % (name, arg))
+    def __iter__(self) -> Iterator[symbol]:
+        return iter(self._items)
+
+
+class _FastIntFlag(metaclass=_IntFlagMeta):
+    """An 'IntFlag' copycat that isn't slow when performing bitwise
+    operations.
+
+    the ``FastIntFlag`` class will return ``enum.IntFlag`` under TYPE_CHECKING
+    and ``_FastIntFlag`` otherwise.
+
+    """
+
+
+if TYPE_CHECKING:
+    from enum import IntFlag
+
+    FastIntFlag = IntFlag
+else:
+    FastIntFlag = _FastIntFlag
+
+
+_E = TypeVar("_E", bound=enum.Enum)
 
 
 def parse_user_argument_for_enum(
     arg: Any,
-    choices: Dict[_T, List[Any]],
+    choices: Dict[_E, List[Any]],
     name: str,
-) -> Optional[_T]:
+    resolve_symbol_names: bool = False,
+) -> Optional[_E]:
     """Given a user parameter, parse the parameter into a chosen value
     from a list of choice objects, typically Enum values.
 
@@ -1729,10 +1684,10 @@ def parse_user_argument_for_enum(
         that is raised if the parameter doesn't match any available argument.
 
     """
-    # TODO: use whatever built in thing Enum provides for this,
-    # if applicable
     for enum_value, choice in choices.items():
         if arg is enum_value:
+            return enum_value
+        elif resolve_symbol_names and arg == enum_value.name:
             return enum_value
         elif arg in choice:
             return enum_value
@@ -1740,13 +1695,13 @@ def parse_user_argument_for_enum(
     if arg is None:
         return None
 
-    raise exc.ArgumentError("Invalid value for '%s': %r" % (name, arg))
+    raise exc.ArgumentError(f"Invalid value for '{name}': {arg!r}")
 
 
 _creation_order = 1
 
 
-def set_creation_order(instance):
+def set_creation_order(instance: Any) -> None:
     """Assign a '_creation_order' sequence to the given instance.
 
     This allows multiple instances to be sorted in order of creation
@@ -1833,6 +1788,9 @@ def warn_limited(msg: str, args: Sequence[Any]) -> None:
     _warnings_warn(msg, exc.SAWarning)
 
 
+_not_sa_pattern = re.compile(r"^(?:sqlalchemy\.(?!testing)|alembic\.)")
+
+
 def _warnings_warn(
     message: Union[str, Warning],
     category: Optional[Type[Warning]] = None,
@@ -1855,7 +1813,7 @@ def _warnings_warn(
         # __globals__ of the decorated string functions we make also.
         # we generate this using {"__name__": fn.__module__}
         while frame is not None and re.match(
-            r"^(?:sqlalchemy\.|alembic\.)", frame.f_globals.get("__name__", "")
+            _not_sa_pattern, frame.f_globals.get("__name__", "")
         ):
             frame = frame.f_back  # type: ignore[assignment]
             stacklevel += 1
@@ -2183,3 +2141,45 @@ def has_compiled_ext(raise_=False):
         )
     else:
         return False
+
+
+@no_type_check
+def console_scripts(
+    path: str, options: dict, ignore_output: bool = False
+) -> None:
+
+    import subprocess
+    import shlex
+    from pathlib import Path
+
+    is_posix = os.name == "posix"
+
+    entrypoint_name = options["entrypoint"]
+
+    for entry in compat.importlib_metadata_get("console_scripts"):
+        if entry.name == entrypoint_name:
+            impl = entry
+            break
+    else:
+        raise Exception(
+            f"Could not find entrypoint console_scripts.{entrypoint_name}"
+        )
+    cmdline_options_str = options.get("options", "")
+    cmdline_options_list = shlex.split(cmdline_options_str, posix=is_posix) + [
+        path
+    ]
+
+    kw = {}
+    if ignore_output:
+        kw["stdout"] = kw["stderr"] = subprocess.DEVNULL
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import %s; %s.%s()" % (impl.module, impl.module, impl.attr),
+        ]
+        + cmdline_options_list,
+        cwd=Path(__file__).parent.parent,
+        **kw,
+    )

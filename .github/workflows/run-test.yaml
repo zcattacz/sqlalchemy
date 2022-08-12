@@ -9,12 +9,14 @@ on:
       # branches used to test the workflow
       - "workflow_test_*"
     paths-ignore:
-      - "doc/**"
       - "examples/**"
 
 env:
   # global env to all steps
   TOX_WORKERS: -n2
+
+permissions:
+  contents: read
 
 jobs:
   run-test:
@@ -68,10 +70,10 @@ jobs:
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
@@ -103,7 +105,7 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Set up emulation
         run: |
@@ -139,10 +141,10 @@ jobs:
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
@@ -172,10 +174,10 @@ jobs:
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
@@ -205,10 +207,10 @@ jobs:
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}

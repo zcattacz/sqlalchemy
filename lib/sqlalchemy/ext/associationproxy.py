@@ -53,7 +53,6 @@ from ..orm import ORMDescriptor
 from ..orm.base import SQLORMOperations
 from ..sql import operators
 from ..sql import or_
-from ..sql.elements import SQLCoreOperations
 from ..util.typing import Literal
 from ..util.typing import Protocol
 from ..util.typing import Self
@@ -61,10 +60,12 @@ from ..util.typing import SupportsIndex
 from ..util.typing import SupportsKeysAndGetItem
 
 if typing.TYPE_CHECKING:
-    from ..orm.attributes import InstrumentedAttribute
     from ..orm.interfaces import MapperProperty
     from ..orm.interfaces import PropComparator
     from ..orm.mapper import Mapper
+    from ..sql._typing import _ColumnExpressionArgument
+    from ..sql._typing import _InfoType
+
 
 _T = TypeVar("_T", bound=Any)
 _T_co = TypeVar("_T_co", bound=Any, covariant=True)
@@ -221,8 +222,8 @@ class _AssociationProxyProtocol(Protocol[_T]):
     proxy_factory: Optional[_ProxyFactoryProtocol]
     proxy_bulk_set: Optional[_ProxyBulkSetProtocol]
 
-    @util.memoized_property
-    def info(self) -> Dict[Any, Any]:
+    @util.ro_memoized_property
+    def info(self) -> _InfoType:
         ...
 
     def for_class(
@@ -259,7 +260,7 @@ class AssociationProxy(
         getset_factory: Optional[_GetSetFactoryProtocol] = None,
         proxy_factory: Optional[_ProxyFactoryProtocol] = None,
         proxy_bulk_set: Optional[_ProxyBulkSetProtocol] = None,
-        info: Optional[Dict[Any, Any]] = None,
+        info: Optional[_InfoType] = None,
         cascade_scalar_deletes: bool = False,
     ):
         """Construct a new :class:`.AssociationProxy`.
@@ -338,7 +339,7 @@ class AssociationProxy(
             id(self),
         )
         if info:
-            self.info = info
+            self.info = info  # type: ignore
 
     @overload
     def __get__(
@@ -583,6 +584,13 @@ class AssociationProxyInstance(SQLORMOperations[_T]):
             return AmbiguousAssociationProxyInstance(
                 parent, owning_class, target_class, value_attr
             )
+        except Exception as err:
+            raise exc.InvalidRequestError(
+                f"Association proxy received an unexpected error when "
+                f"trying to retreive attribute "
+                f'"{target_class.__name__}.{parent.value_attr}" from '
+                f'class "{target_class.__name__}": {err}'
+            ) from err
         else:
             return cls._construct_for_assoc(
                 target_assoc, parent, owning_class, target_class, value_attr
@@ -624,7 +632,9 @@ class AssociationProxyInstance(SQLORMOperations[_T]):
 
     @property
     def _comparator(self) -> PropComparator[Any]:
-        return self._get_property().comparator
+        return getattr(  # type: ignore
+            self.owning_class, self.target_collection
+        ).comparator
 
     def __clause_element__(self) -> NoReturn:
         raise NotImplementedError(
@@ -770,8 +780,8 @@ class AssociationProxyInstance(SQLORMOperations[_T]):
 
             return getter, plain_setter
 
-    @property
-    def info(self) -> Dict[Any, Any]:
+    @util.ro_non_memoized_property
+    def info(self) -> _InfoType:
         return self.parent.info
 
     @overload
@@ -950,7 +960,9 @@ class AssociationProxyInstance(SQLORMOperations[_T]):
         proxy.setter = setter
 
     def _criterion_exists(
-        self, criterion: Optional[SQLCoreOperations[Any]] = None, **kwargs: Any
+        self,
+        criterion: Optional[_ColumnExpressionArgument[bool]] = None,
+        **kwargs: Any,
     ) -> ColumnElement[bool]:
         is_has = kwargs.pop("is_has", None)
 
@@ -962,8 +974,8 @@ class AssociationProxyInstance(SQLORMOperations[_T]):
             return self._comparator._criterion_exists(inner)
 
         if self._target_is_object:
-            prop = getattr(self.target_class, self.value_attr)
-            value_expr = prop._criterion_exists(criterion, **kwargs)
+            attr = getattr(self.target_class, self.value_attr)
+            value_expr = attr.comparator._criterion_exists(criterion, **kwargs)
         else:
             if kwargs:
                 raise exc.ArgumentError(
@@ -981,8 +993,10 @@ class AssociationProxyInstance(SQLORMOperations[_T]):
         return self._comparator._criterion_exists(value_expr)
 
     def any(
-        self, criterion: Optional[SQLCoreOperations[Any]] = None, **kwargs: Any
-    ) -> SQLCoreOperations[Any]:
+        self,
+        criterion: Optional[_ColumnExpressionArgument[bool]] = None,
+        **kwargs: Any,
+    ) -> ColumnElement[bool]:
         """Produce a proxied 'any' expression using EXISTS.
 
         This expression will be a composed product
@@ -1003,8 +1017,10 @@ class AssociationProxyInstance(SQLORMOperations[_T]):
         )
 
     def has(
-        self, criterion: Optional[SQLCoreOperations[Any]] = None, **kwargs: Any
-    ) -> SQLCoreOperations[Any]:
+        self,
+        criterion: Optional[_ColumnExpressionArgument[bool]] = None,
+        **kwargs: Any,
+    ) -> ColumnElement[bool]:
         """Produce a proxied 'has' expression using EXISTS.
 
         This expression will be a composed product
@@ -1062,12 +1078,16 @@ class AmbiguousAssociationProxyInstance(AssociationProxyInstance[_T]):
         self._ambiguous()
 
     def any(
-        self, criterion: Optional[SQLCoreOperations[Any]] = None, **kwargs: Any
+        self,
+        criterion: Optional[_ColumnExpressionArgument[bool]] = None,
+        **kwargs: Any,
     ) -> NoReturn:
         self._ambiguous()
 
     def has(
-        self, criterion: Optional[SQLCoreOperations[Any]] = None, **kwargs: Any
+        self,
+        criterion: Optional[_ColumnExpressionArgument[bool]] = None,
+        **kwargs: Any,
     ) -> NoReturn:
         self._ambiguous()
 
@@ -1169,7 +1189,7 @@ class ObjectAssociationProxyInstance(AssociationProxyInstance[_T]):
                 **{self.value_attr: other}
             )
 
-    def __eq__(self, obj: Any) -> ColumnElement[bool]:  # type: ignore[override]  # noqa E501
+    def __eq__(self, obj: Any) -> ColumnElement[bool]:  # type: ignore[override]  # noqa: E501
         # note the has() here will fail for collections; eq_()
         # is only allowed with a scalar.
         if obj is None:
@@ -1180,7 +1200,7 @@ class ObjectAssociationProxyInstance(AssociationProxyInstance[_T]):
         else:
             return self._comparator.has(**{self.value_attr: obj})
 
-    def __ne__(self, obj: Any) -> ColumnElement[bool]:  # type: ignore[override]  # noqa E501
+    def __ne__(self, obj: Any) -> ColumnElement[bool]:  # type: ignore[override]  # noqa: E501
         # note the has() here will fail for collections; eq_()
         # is only allowed with a scalar.
         return self._comparator.has(
@@ -1196,7 +1216,7 @@ class ColumnAssociationProxyInstance(AssociationProxyInstance[_T]):
     _target_is_object: bool = False
     _is_canonical = True
 
-    def __eq__(self, other: Any) -> ColumnElement[bool]:  # type: ignore[override]  # noqa E501
+    def __eq__(self, other: Any) -> ColumnElement[bool]:  # type: ignore[override]  # noqa: E501
         # special case "is None" to check for no related row as well
         expr = self._criterion_exists(
             self.remote_attr.operate(operators.eq, other)
@@ -1295,8 +1315,6 @@ class _AssociationCollection(Generic[_IT]):
 
     def __bool__(self) -> bool:
         return bool(self.col)
-
-    __nonzero__ = __bool__
 
     def __getstate__(self) -> Any:
         return {"parent": self.parent, "lazy_collection": self.lazy_collection}
@@ -1729,8 +1747,6 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
         else:
             return False
 
-    __nonzero__ = __bool__
-
     def __contains__(self, __o: object) -> bool:
         for member in self.col:
             if self._get(member) == __o:
@@ -1796,7 +1812,7 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
         for member in removals:
             remover(member)
 
-    def __ior__(
+    def __ior__(  # type: ignore
         self: Self, other: AbstractSet[_S]
     ) -> MutableSet[Union[_T, _S]]:
         if not collections._set_binops_check_strict(self, other):
@@ -1879,7 +1895,7 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
         for value in add:
             self.add(value)
 
-    def __ixor__(self, other: AbstractSet[_S]) -> MutableSet[Union[_T, _S]]:
+    def __ixor__(self, other: AbstractSet[_S]) -> MutableSet[Union[_T, _S]]:  # type: ignore  # noqa: E501
         if not collections._set_binops_check_strict(self, other):
             raise NotImplementedError()
 

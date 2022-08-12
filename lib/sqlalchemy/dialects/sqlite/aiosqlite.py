@@ -4,6 +4,8 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: ignore-errors
+
 
 r"""
 
@@ -210,7 +212,6 @@ class AsyncAdapt_aiosqlite_connection(AdaptedConnection):
             self._handle_exception(error)
 
     def close(self):
-        # print(">close", self)
         try:
             self.await_(self._connection.close())
         except Exception as error:

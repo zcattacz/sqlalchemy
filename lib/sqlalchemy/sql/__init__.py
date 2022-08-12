@@ -4,12 +4,18 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+from typing import Any
+from typing import TYPE_CHECKING
 
 from .base import Executable as Executable
 from .compiler import COLLECT_CARTESIAN_PRODUCTS as COLLECT_CARTESIAN_PRODUCTS
 from .compiler import FROM_LINTING as FROM_LINTING
 from .compiler import NO_LINTING as NO_LINTING
 from .compiler import WARN_LINTING as WARN_LINTING
+from .ddl import BaseDDLElement as BaseDDLElement
+from .ddl import DDL as DDL
+from .ddl import DDLElement as DDLElement
+from .ddl import ExecutableDDLElement as ExecutableDDLElement
 from .expression import Alias as Alias
 from .expression import alias as alias
 from .expression import all_ as all_
@@ -97,7 +103,7 @@ from .expression import within_group as within_group
 from .visitors import ClauseVisitor as ClauseVisitor
 
 
-def __go(lcls):
+def __go(lcls: Any) -> None:
     from .. import util as _sa_util
 
     from . import base
@@ -109,14 +115,14 @@ def __go(lcls):
     from . import traversals
     from . import type_api
 
-    base.coercions = elements.coercions = coercions
-    base.elements = elements
-    base.type_api = type_api
-    coercions.elements = elements
-    coercions.lambdas = lambdas
-    coercions.schema = schema
-    coercions.selectable = selectable
-    coercions.traversals = traversals
+    if not TYPE_CHECKING:
+        base.coercions = elements.coercions = coercions
+        base.elements = elements
+        base.type_api = type_api
+        coercions.elements = elements
+        coercions.lambdas = lambdas
+        coercions.schema = schema
+        coercions.selectable = selectable
 
     from .annotation import _prepare_annotations
     from .annotation import Annotated

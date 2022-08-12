@@ -26,11 +26,13 @@ from . import roles
 from . import type_api
 from .elements import and_
 from .elements import BinaryExpression
-from .elements import ClauseList
+from .elements import ClauseElement
 from .elements import CollationClause
 from .elements import CollectionAggregate
+from .elements import ExpressionClauseList
 from .elements import False_
 from .elements import Null
+from .elements import OperatorExpression
 from .elements import or_
 from .elements import True_
 from .elements import UnaryExpression
@@ -43,7 +45,7 @@ _T = typing.TypeVar("_T", bound=Any)
 if typing.TYPE_CHECKING:
     from .elements import ColumnElement
     from .operators import custom_op
-    from .sqltypes import TypeEngine
+    from .type_api import TypeEngine
 
 
 def _boolean_compare(
@@ -53,13 +55,11 @@ def _boolean_compare(
     *,
     negate_op: Optional[OperatorType] = None,
     reverse: bool = False,
-    _python_is_types=(util.NoneType, bool),
-    _any_all_expr=False,
-    result_type: Optional[
-        Union[Type["TypeEngine[bool]"], "TypeEngine[bool]"]
-    ] = None,
+    _python_is_types: Tuple[Type[Any], ...] = (type(None), bool),
+    _any_all_expr: bool = False,
+    result_type: Optional[TypeEngine[bool]] = None,
     **kwargs: Any,
-) -> BinaryExpression[bool]:
+) -> OperatorExpression[bool]:
     if result_type is None:
         result_type = type_api.BOOLEANTYPE
 
@@ -70,7 +70,7 @@ def _boolean_compare(
         if op in (operators.eq, operators.ne) and isinstance(
             obj, (bool, True_, False_)
         ):
-            return BinaryExpression(
+            return OperatorExpression._construct_for_op(
                 expr,
                 coercions.expect(roles.ConstExprRole, obj),
                 op,
@@ -82,7 +82,7 @@ def _boolean_compare(
             operators.is_distinct_from,
             operators.is_not_distinct_from,
         ):
-            return BinaryExpression(
+            return OperatorExpression._construct_for_op(
                 expr,
                 coercions.expect(roles.ConstExprRole, obj),
                 op,
@@ -97,7 +97,7 @@ def _boolean_compare(
         else:
             # all other None uses IS, IS NOT
             if op in (operators.eq, operators.is_):
-                return BinaryExpression(
+                return OperatorExpression._construct_for_op(
                     expr,
                     coercions.expect(roles.ConstExprRole, obj),
                     operators.is_,
@@ -105,7 +105,7 @@ def _boolean_compare(
                     type_=result_type,
                 )
             elif op in (operators.ne, operators.is_not):
-                return BinaryExpression(
+                return OperatorExpression._construct_for_op(
                     expr,
                     coercions.expect(roles.ConstExprRole, obj),
                     operators.is_not,
@@ -124,7 +124,7 @@ def _boolean_compare(
         )
 
     if reverse:
-        return BinaryExpression(
+        return OperatorExpression._construct_for_op(
             obj,
             expr,
             op,
@@ -133,7 +133,7 @@ def _boolean_compare(
             modifiers=kwargs,
         )
     else:
-        return BinaryExpression(
+        return OperatorExpression._construct_for_op(
             expr,
             obj,
             op,
@@ -165,14 +165,12 @@ def _custom_op_operate(
 def _binary_operate(
     expr: ColumnElement[Any],
     op: OperatorType,
-    obj: roles.BinaryElementRole,
+    obj: roles.BinaryElementRole[Any],
     *,
     reverse: bool = False,
-    result_type: Optional[
-        Union[Type["TypeEngine[_T]"], "TypeEngine[_T]"]
-    ] = None,
+    result_type: Optional[TypeEngine[_T]] = None,
     **kw: Any,
-) -> BinaryExpression[_T]:
+) -> OperatorExpression[_T]:
 
     coerced_obj = coercions.expect(
         roles.BinaryElementRole, obj, expr=expr, operator=op
@@ -188,11 +186,13 @@ def _binary_operate(
             op, right.comparator
         )
 
-    return BinaryExpression(left, right, op, type_=result_type, modifiers=kw)
+    return OperatorExpression._construct_for_op(
+        left, right, op, type_=result_type, modifiers=kw
+    )
 
 
 def _conjunction_operate(
-    expr: ColumnElement[Any], op: OperatorType, other, **kw
+    expr: ColumnElement[Any], op: OperatorType, other: Any, **kw: Any
 ) -> ColumnElement[Any]:
     if op is operators.and_:
         return and_(expr, other)
@@ -203,7 +203,10 @@ def _conjunction_operate(
 
 
 def _scalar(
-    expr: ColumnElement[Any], op: OperatorType, fn, **kw
+    expr: ColumnElement[Any],
+    op: OperatorType,
+    fn: Callable[[ColumnElement[Any]], ColumnElement[Any]],
+    **kw: Any,
 ) -> ColumnElement[Any]:
     return fn(expr)
 
@@ -211,9 +214,9 @@ def _scalar(
 def _in_impl(
     expr: ColumnElement[Any],
     op: OperatorType,
-    seq_or_selectable,
+    seq_or_selectable: ClauseElement,
     negate_op: OperatorType,
-    **kw,
+    **kw: Any,
 ) -> ColumnElement[Any]:
     seq_or_selectable = coercions.expect(
         roles.InElementRole, seq_or_selectable, expr=expr, operator=op
@@ -227,9 +230,13 @@ def _in_impl(
 
 
 def _getitem_impl(
-    expr: ColumnElement[Any], op: OperatorType, other, **kw
+    expr: ColumnElement[Any], op: OperatorType, other: Any, **kw: Any
 ) -> ColumnElement[Any]:
-    if isinstance(expr.type, type_api.INDEXABLE):
+    if (
+        isinstance(expr.type, type_api.INDEXABLE)
+        or isinstance(expr.type, type_api.TypeDecorator)
+        and isinstance(expr.type.impl_instance, type_api.INDEXABLE)
+    ):
         other = coercions.expect(
             roles.BinaryElementRole, other, expr=expr, operator=op
         )
@@ -239,7 +246,7 @@ def _getitem_impl(
 
 
 def _unsupported_impl(
-    expr: ColumnElement[Any], op: OperatorType, *arg, **kw
+    expr: ColumnElement[Any], op: OperatorType, *arg: Any, **kw: Any
 ) -> NoReturn:
     raise NotImplementedError(
         "Operator '%s' is not supported on " "this expression" % op.__name__
@@ -247,7 +254,7 @@ def _unsupported_impl(
 
 
 def _inv_impl(
-    expr: ColumnElement[Any], op: OperatorType, **kw
+    expr: ColumnElement[Any], op: OperatorType, **kw: Any
 ) -> ColumnElement[Any]:
     """See :meth:`.ColumnOperators.__inv__`."""
 
@@ -260,14 +267,14 @@ def _inv_impl(
 
 
 def _neg_impl(
-    expr: ColumnElement[Any], op: OperatorType, **kw
+    expr: ColumnElement[Any], op: OperatorType, **kw: Any
 ) -> ColumnElement[Any]:
     """See :meth:`.ColumnOperators.__neg__`."""
     return UnaryExpression(expr, operator=operators.neg, type_=expr.type)
 
 
 def _match_impl(
-    expr: ColumnElement[Any], op: OperatorType, other, **kw
+    expr: ColumnElement[Any], op: OperatorType, other: Any, **kw: Any
 ) -> ColumnElement[Any]:
     """See :meth:`.ColumnOperators.match`."""
 
@@ -289,7 +296,7 @@ def _match_impl(
 
 
 def _distinct_impl(
-    expr: ColumnElement[Any], op: OperatorType, **kw
+    expr: ColumnElement[Any], op: OperatorType, **kw: Any
 ) -> ColumnElement[Any]:
     """See :meth:`.ColumnOperators.distinct`."""
     return UnaryExpression(
@@ -298,12 +305,18 @@ def _distinct_impl(
 
 
 def _between_impl(
-    expr: ColumnElement[Any], op: OperatorType, cleft, cright, **kw
+    expr: ColumnElement[Any],
+    op: OperatorType,
+    cleft: Any,
+    cright: Any,
+    **kw: Any,
 ) -> ColumnElement[Any]:
     """See :meth:`.ColumnOperators.between`."""
     return BinaryExpression(
         expr,
-        ClauseList(
+        ExpressionClauseList._construct_for_list(
+            operators.and_,
+            type_api.NULLTYPE,
             coercions.expect(
                 roles.BinaryElementRole,
                 cleft,
@@ -316,9 +329,7 @@ def _between_impl(
                 expr=expr,
                 operator=operators.and_,
             ),
-            operator=operators.and_,
             group=False,
-            group_contents=False,
         ),
         op,
         negate=operators.not_between_op
@@ -329,26 +340,32 @@ def _between_impl(
 
 
 def _collate_impl(
-    expr: ColumnElement[Any], op: OperatorType, collation, **kw
-) -> ColumnElement[Any]:
+    expr: ColumnElement[str], op: OperatorType, collation: str, **kw: Any
+) -> ColumnElement[str]:
     return CollationClause._create_collation_expression(expr, collation)
 
 
 def _regexp_match_impl(
-    expr: ColumnElement[Any], op: OperatorType, pattern, flags, **kw
+    expr: ColumnElement[str],
+    op: OperatorType,
+    pattern: Any,
+    flags: Optional[str],
+    **kw: Any,
 ) -> ColumnElement[Any]:
     if flags is not None:
-        flags = coercions.expect(
+        flags_expr = coercions.expect(
             roles.BinaryElementRole,
             flags,
             expr=expr,
             operator=operators.regexp_replace_op,
         )
+    else:
+        flags_expr = None
     return _boolean_compare(
         expr,
         op,
         pattern,
-        flags=flags,
+        flags=flags_expr,
         negate_op=operators.not_regexp_match_op
         if op is operators.regexp_match_op
         else operators.regexp_match_op,
@@ -359,10 +376,10 @@ def _regexp_match_impl(
 def _regexp_replace_impl(
     expr: ColumnElement[Any],
     op: OperatorType,
-    pattern,
-    replacement,
-    flags,
-    **kw,
+    pattern: Any,
+    replacement: Any,
+    flags: Optional[str],
+    **kw: Any,
 ) -> ColumnElement[Any]:
     replacement = coercions.expect(
         roles.BinaryElementRole,
@@ -371,21 +388,29 @@ def _regexp_replace_impl(
         operator=operators.regexp_replace_op,
     )
     if flags is not None:
-        flags = coercions.expect(
+        flags_expr = coercions.expect(
             roles.BinaryElementRole,
             flags,
             expr=expr,
             operator=operators.regexp_replace_op,
         )
+    else:
+        flags_expr = None
     return _binary_operate(
-        expr, op, pattern, replacement=replacement, flags=flags, **kw
+        expr, op, pattern, replacement=replacement, flags=flags_expr, **kw
     )
 
 
 # a mapping of operators with the method they use, along with
 # additional keyword arguments to be passed
 operator_lookup: Dict[
-    str, Tuple[Callable[..., ColumnElement[Any]], util.immutabledict]
+    str,
+    Tuple[
+        Callable[..., ColumnElement[Any]],
+        util.immutabledict[
+            str, Union[OperatorType, Callable[..., ColumnElement[Any]]]
+        ],
+    ],
 ] = {
     "and_": (_conjunction_operate, util.EMPTY_DICT),
     "or_": (_conjunction_operate, util.EMPTY_DICT),

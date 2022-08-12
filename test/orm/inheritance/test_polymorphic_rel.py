@@ -1,5 +1,6 @@
 from sqlalchemy import desc
 from sqlalchemy import exc as sa_exc
+from sqlalchemy import exists
 from sqlalchemy import func
 from sqlalchemy import select
 from sqlalchemy import testing
@@ -10,10 +11,10 @@ from sqlalchemy.orm import join
 from sqlalchemy.orm import joinedload
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import subqueryload
+from sqlalchemy.orm import with_parent
 from sqlalchemy.orm import with_polymorphic
 from sqlalchemy.testing import assert_raises
 from sqlalchemy.testing import eq_
-from sqlalchemy.testing import fixtures
 from sqlalchemy.testing.assertsql import CompiledSQL
 from sqlalchemy.testing.fixtures import fixture_session
 from ._poly_fixtures import _Polymorphic
@@ -30,7 +31,7 @@ from ._poly_fixtures import Paperwork
 from ._poly_fixtures import Person
 
 
-class _PolymorphicTestBase(fixtures.NoCache):
+class _PolymorphicTestBase:
     __backend__ = True
     __dialect__ = "default_enhanced"
 
@@ -63,6 +64,44 @@ class _PolymorphicTestBase(fixtures.NoCache):
             cls.c2_employees,
         )
         e1, e2, e3, b1, m1 = cls.e1, cls.e2, cls.e3, cls.b1, cls.m1
+
+    @testing.requires.ctes
+    def test_cte_clone_issue(self):
+        """test #8357"""
+
+        sess = fixture_session()
+
+        cte = select(Engineer.person_id).cte(name="test_cte")
+
+        stmt = (
+            select(Engineer)
+            .where(exists().where(Engineer.person_id == cte.c.person_id))
+            .where(exists().where(Engineer.person_id == cte.c.person_id))
+        ).order_by(Engineer.person_id)
+
+        self.assert_compile(
+            stmt,
+            "WITH test_cte AS (SELECT engineers.person_id AS person_id "
+            "FROM people JOIN engineers ON people.person_id = "
+            "engineers.person_id) SELECT engineers.person_id, "
+            "people.person_id AS person_id_1, people.company_id, "
+            "people.name, people.type, engineers.status, "
+            "engineers.engineer_name, engineers.primary_language FROM people "
+            "JOIN engineers ON people.person_id = engineers.person_id WHERE "
+            "(EXISTS (SELECT * FROM test_cte WHERE engineers.person_id = "
+            "test_cte.person_id)) AND (EXISTS (SELECT * FROM test_cte "
+            "WHERE engineers.person_id = test_cte.person_id)) "
+            "ORDER BY engineers.person_id",
+        )
+        result = sess.scalars(stmt)
+        eq_(
+            result.all(),
+            [
+                Engineer(name="dilbert"),
+                Engineer(name="wally"),
+                Engineer(name="vlad"),
+            ],
+        )
 
     def test_loads_at_once(self):
         """
@@ -194,6 +233,34 @@ class _PolymorphicTestBase(fixtures.NoCache):
             sess.get(Manager, b1.person_id),
             Boss(name="pointy haired boss", golf_swing="fore"),
         )
+
+    def test_lazyload_related_w_cache_check(self):
+        sess = fixture_session()
+
+        c1 = sess.get(Company, 1)
+        c2 = sess.get(Company, 2)
+
+        q1 = (
+            sess.query(Person)
+            .filter(with_parent(c1, Company.employees))
+            .order_by(Person.person_id)
+        )
+        eq_(
+            q1.all(),
+            [
+                Engineer(name="dilbert"),
+                Engineer(name="wally"),
+                Boss(name="pointy haired boss"),
+                Manager(name="dogbert"),
+            ],
+        )
+
+        q2 = (
+            sess.query(Person)
+            .filter(with_parent(c2, Company.employees))
+            .order_by(Person.person_id)
+        )
+        eq_(q2.all(), [Engineer(name="vlad")])
 
     def test_multi_join(self):
         sess = fixture_session()
@@ -881,7 +948,7 @@ class _PolymorphicTestBase(fixtures.NoCache):
 
         self.assert_sql_count(testing.db, go, 1)
 
-    def test_with_polymorphic_three_future(self):
+    def test_with_polymorphic_three_future(self, nocache):
         sess = fixture_session()
 
         def go():
@@ -2178,7 +2245,14 @@ class PolymorphicPolymorphicTest(
             "anon_1.boss_boss_id AS anon_1_boss_boss_id, "
             "anon_1.boss_golf_swing AS anon_1_boss_golf_swing, "
             "companies.name AS companies_name "
-            "FROM (SELECT people.person_id AS people_person_id, "
+            "FROM companies JOIN "
+            "(people LEFT OUTER JOIN engineers "
+            "ON people.person_id = engineers.person_id "
+            "LEFT OUTER JOIN managers "
+            "ON people.person_id = managers.person_id "
+            "LEFT OUTER JOIN boss ON managers.person_id = boss.boss_id) "
+            "ON companies.company_id = people.company_id, "
+            "(SELECT people.person_id AS people_person_id, "
             "people.company_id AS people_company_id, "
             "people.name AS people_name, people.type AS people_type, "
             "engineers.person_id AS engineers_person_id, "
@@ -2194,14 +2268,7 @@ class PolymorphicPolymorphicTest(
             "ON people.person_id = engineers.person_id "
             "LEFT OUTER JOIN managers "
             "ON people.person_id = managers.person_id LEFT OUTER JOIN boss "
-            "ON managers.person_id = boss.boss_id) AS anon_1, "
-            "companies JOIN "
-            "(people LEFT OUTER JOIN engineers "
-            "ON people.person_id = engineers.person_id "
-            "LEFT OUTER JOIN managers "
-            "ON people.person_id = managers.person_id "
-            "LEFT OUTER JOIN boss ON managers.person_id = boss.boss_id) "
-            "ON companies.company_id = people.company_id "
+            "ON managers.person_id = boss.boss_id) AS anon_1 "
             "WHERE anon_1.people_name = :people_name_1 "
             "ORDER BY anon_1.people_person_id",
         )
@@ -2246,6 +2313,12 @@ class PolymorphicPolymorphicTest(
 
 
 class PolymorphicUnionsTest(_PolymorphicTestBase, _PolymorphicUnions):
+    @testing.skip_if(
+        lambda: True, "join condition doesn't work w/ this mapping"
+    )
+    def test_lazyload_related_w_cache_check(self):
+        pass
+
     def test_with_polymorphic_two_future_default_wp(self):
         """test #7262
 
@@ -2347,6 +2420,12 @@ class PolymorphicUnionsTest(_PolymorphicTestBase, _PolymorphicUnions):
 class PolymorphicAliasedJoinsTest(
     _PolymorphicTestBase, _PolymorphicAliasedJoins
 ):
+    @testing.skip_if(
+        lambda: True, "join condition doesn't work w/ this mapping"
+    )
+    def test_lazyload_related_w_cache_check(self):
+        pass
+
     def test_with_polymorphic_two_future_default_wp(self):
         """test #7262
 

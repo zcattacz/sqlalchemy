@@ -4,12 +4,17 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: ignore-errors
 
 """ORM event interfaces.
 
 """
 from __future__ import annotations
 
+from typing import Any
+from typing import Optional
+from typing import Type
+from typing import TYPE_CHECKING
 import weakref
 
 from . import instrumentation
@@ -25,6 +30,10 @@ from .. import event
 from .. import exc
 from .. import util
 from ..util.compat import inspect_getfullargspec
+
+if TYPE_CHECKING:
+    from ._typing import _O
+    from .instrumentation import ClassManager
 
 
 class InstrumentationEvents(event.Events):
@@ -53,7 +62,7 @@ class InstrumentationEvents(event.Events):
     _dispatch_target = instrumentation.InstrumentationFactory
 
     @classmethod
-    def _accept_with(cls, target):
+    def _accept_with(cls, target, identifier):
         if isinstance(target, type):
             return _InstrumentationEventsHold(target)
         else:
@@ -194,7 +203,7 @@ class InstanceEvents(event.Events):
 
     @classmethod
     @util.preload_module("sqlalchemy.orm")
-    def _accept_with(cls, target):
+    def _accept_with(cls, target, identifier):
         orm = util.preloaded.orm
 
         if isinstance(target, instrumentation.ClassManager):
@@ -213,7 +222,7 @@ class InstanceEvents(event.Events):
             if issubclass(target, mapperlib.Mapper):
                 return instrumentation.ClassManager
             else:
-                manager = instrumentation.manager_of_class(target)
+                manager = instrumentation.opt_manager_of_class(target)
                 if manager:
                     return manager
                 else:
@@ -612,8 +621,8 @@ class _EventsHold(event.RefCollection):
 class _InstanceEventsHold(_EventsHold):
     all_holds = weakref.WeakKeyDictionary()
 
-    def resolve(self, class_):
-        return instrumentation.manager_of_class(class_)
+    def resolve(self, class_: Type[_O]) -> Optional[ClassManager[_O]]:
+        return instrumentation.opt_manager_of_class(class_)
 
     class HoldInstanceEvents(_EventsHold.HoldEvents, InstanceEvents):
         pass
@@ -696,7 +705,7 @@ class MapperEvents(event.Events):
 
     @classmethod
     @util.preload_module("sqlalchemy.orm")
-    def _accept_with(cls, target):
+    def _accept_with(cls, target, identifier):
         orm = util.preloaded.orm
 
         if target is orm.mapper:
@@ -1324,7 +1333,7 @@ class _MapperEventsHold(_EventsHold):
 _sessionevents_lifecycle_event_names = set()
 
 
-class SessionEvents(event.Events):
+class SessionEvents(event.Events[Session]):
     """Define events specific to :class:`.Session` lifecycle.
 
     e.g.::
@@ -1374,7 +1383,7 @@ class SessionEvents(event.Events):
         return fn
 
     @classmethod
-    def _accept_with(cls, target):
+    def _accept_with(cls, target, identifier):
         if isinstance(target, scoped_session):
 
             target = target.session_factory
@@ -1396,12 +1405,21 @@ class SessionEvents(event.Events):
                 return target
         elif isinstance(target, Session):
             return target
+        elif hasattr(target, "_no_async_engine_events"):
+            target._no_async_engine_events()
         else:
             # allows alternate SessionEvents-like-classes to be consulted
-            return event.Events._accept_with(target)
+            return event.Events._accept_with(target, identifier)
 
     @classmethod
-    def _listen(cls, event_key, raw=False, restore_load_context=False, **kw):
+    def _listen(
+        cls,
+        event_key: Any,
+        *,
+        raw: bool = False,
+        restore_load_context: bool = False,
+        **kw: Any,
+    ) -> None:
         is_instance_event = (
             event_key.identifier in _sessionevents_lifecycle_event_names
         )
@@ -1909,7 +1927,8 @@ class SessionEvents(event.Events):
 
     @_lifecycle_event
     def transient_to_pending(self, session, instance):
-        """Intercept the "transient to pending" transition for a specific object.
+        """Intercept the "transient to pending" transition for a specific
+        object.
 
         This event is a specialization of the
         :meth:`.SessionEvents.after_attach` event which is only invoked
@@ -1930,7 +1949,8 @@ class SessionEvents(event.Events):
 
     @_lifecycle_event
     def pending_to_transient(self, session, instance):
-        """Intercept the "pending to transient" transition for a specific object.
+        """Intercept the "pending to transient" transition for a specific
+        object.
 
         This less common transition occurs when an pending object that has
         not been flushed is evicted from the session; this can occur
@@ -1951,7 +1971,8 @@ class SessionEvents(event.Events):
 
     @_lifecycle_event
     def persistent_to_transient(self, session, instance):
-        """Intercept the "persistent to transient" transition for a specific object.
+        """Intercept the "persistent to transient" transition for a specific
+        object.
 
         This less common transition occurs when an pending object that has
         has been flushed is evicted from the session; this can occur
@@ -1971,7 +1992,8 @@ class SessionEvents(event.Events):
 
     @_lifecycle_event
     def pending_to_persistent(self, session, instance):
-        """Intercept the "pending to persistent"" transition for a specific object.
+        """Intercept the "pending to persistent"" transition for a specific
+        object.
 
         This event is invoked within the flush process, and is
         similar to scanning the :attr:`.Session.new` collection within
@@ -1993,7 +2015,8 @@ class SessionEvents(event.Events):
 
     @_lifecycle_event
     def detached_to_persistent(self, session, instance):
-        """Intercept the "detached to persistent" transition for a specific object.
+        """Intercept the "detached to persistent" transition for a specific
+        object.
 
         This event is a specialization of the
         :meth:`.SessionEvents.after_attach` event which is only invoked
@@ -2029,7 +2052,8 @@ class SessionEvents(event.Events):
 
     @_lifecycle_event
     def loaded_as_persistent(self, session, instance):
-        """Intercept the "loaded as persistent" transition for a specific object.
+        """Intercept the "loaded as persistent" transition for a specific
+        object.
 
         This event is invoked within the ORM loading process, and is invoked
         very similarly to the :meth:`.InstanceEvents.load` event.  However,
@@ -2064,7 +2088,8 @@ class SessionEvents(event.Events):
 
     @_lifecycle_event
     def persistent_to_deleted(self, session, instance):
-        """Intercept the "persistent to deleted" transition for a specific object.
+        """Intercept the "persistent to deleted" transition for a specific
+        object.
 
         This event is invoked when a persistent object's identity
         is deleted from the database within a flush, however the object
@@ -2096,7 +2121,8 @@ class SessionEvents(event.Events):
 
     @_lifecycle_event
     def deleted_to_persistent(self, session, instance):
-        """Intercept the "deleted to persistent" transition for a specific object.
+        """Intercept the "deleted to persistent" transition for a specific
+        object.
 
         This transition occurs only when an object that's been deleted
         successfully in a flush is restored due to a call to
@@ -2113,7 +2139,8 @@ class SessionEvents(event.Events):
 
     @_lifecycle_event
     def deleted_to_detached(self, session, instance):
-        """Intercept the "deleted to detached" transition for a specific object.
+        """Intercept the "deleted to detached" transition for a specific
+        object.
 
         This event is invoked when a deleted object is evicted
         from the session.   The typical case when this occurs is when
@@ -2136,7 +2163,8 @@ class SessionEvents(event.Events):
 
     @_lifecycle_event
     def persistent_to_detached(self, session, instance):
-        """Intercept the "persistent to detached" transition for a specific object.
+        """Intercept the "persistent to detached" transition for a specific
+        object.
 
         This event is invoked when a persistent object is evicted
         from the session.  There are many conditions that cause this
@@ -2245,7 +2273,7 @@ class AttributeEvents(event.Events):
         return dispatch
 
     @classmethod
-    def _accept_with(cls, target):
+    def _accept_with(cls, target, identifier):
         # TODO: coverage
         if isinstance(target, interfaces.MapperProperty):
             return getattr(target.parent.class_, target.key)

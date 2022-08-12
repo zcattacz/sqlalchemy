@@ -52,7 +52,7 @@ class URL(NamedTuple):
     format of the URL is an RFC-1738-style string.
 
     To create a new :class:`_engine.URL` object, use the
-    :func:`_engine.url.make_url` function.  To construct a :class:`_engine.URL`
+    :func:`.make_url` function.  To construct a :class:`_engine.URL`
     programmatically, use the :meth:`_engine.URL.create` constructor.
 
     .. versionchanged:: 1.4
@@ -66,18 +66,16 @@ class URL(NamedTuple):
         :class:`_engine.URL` object with modifications.   See notes for this
         change at :ref:`change_5526`.
 
+    .. seealso::
+
+        :ref:`database_urls`
+
     :class:`_engine.URL` contains the following attributes:
 
     * :attr:`_engine.URL.drivername`: database backend and driver name, such as
       ``postgresql+psycopg2``
     * :attr:`_engine.URL.username`: username string
-    * :attr:`_engine.URL.password`: password string, or object that includes
-      a ``__str__()`` method that produces a password.
-
-      .. note::  A password-producing object will be stringified only
-         **once** per :class:`_engine.Engine` object.  For dynamic password
-         generation per connect, see :ref:`engines_dynamic_tokens`.
-
+    * :attr:`_engine.URL.password`: password string
     * :attr:`_engine.URL.host`: string hostname
     * :attr:`_engine.URL.port`: integer port number
     * :attr:`_engine.URL.database`: string database name
@@ -89,12 +87,57 @@ class URL(NamedTuple):
     """
 
     drivername: str
+    """database backend and driver name, such as
+    ``postgresql+psycopg2``
+
+    """
+
     username: Optional[str]
+    "username string"
+
     password: Optional[str]
+    """password, which is normally a string but may also be any
+    object that has a ``__str__()`` method."""
+
     host: Optional[str]
+    """hostname or IP number.  May also be a data source name for some
+    drivers."""
+
     port: Optional[int]
+    """integer port number"""
+
     database: Optional[str]
+    """database name"""
+
     query: util.immutabledict[str, Union[Tuple[str, ...], str]]
+    """an immutable mapping representing the query string.  contains strings
+       for keys and either strings or tuples of strings for values, e.g.::
+
+            >>> from sqlalchemy.engine import make_url
+            >>> url = make_url("postgresql+psycopg2://user:pass@host/dbname?alt_host=host1&alt_host=host2&ssl_cipher=%2Fpath%2Fto%2Fcrt")
+            >>> url.query
+            immutabledict({'alt_host': ('host1', 'host2'), 'ssl_cipher': '/path/to/crt'})
+
+         To create a mutable copy of this mapping, use the ``dict`` constructor::
+
+            mutable_query_opts = dict(url.query)
+
+       .. seealso::
+
+          :attr:`_engine.URL.normalized_query` - normalizes all values into sequences
+          for consistent processing
+
+          Methods for altering the contents of :attr:`_engine.URL.query`:
+
+          :meth:`_engine.URL.update_query_dict`
+
+          :meth:`_engine.URL.update_query_string`
+
+          :meth:`_engine.URL.update_query_pairs`
+
+          :meth:`_engine.URL.difference_update_query`
+
+    """  # noqa: E501
 
     @classmethod
     def create(
@@ -108,6 +151,10 @@ class URL(NamedTuple):
         query: Mapping[str, Union[Sequence[str], str]] = util.EMPTY_DICT,
     ) -> URL:
         """Create a new :class:`_engine.URL` object.
+
+        .. seealso::
+
+            :ref:`database_urls`
 
         :param drivername: the name of the database backend. This name will
           correspond to a module in sqlalchemy/databases or a third party
@@ -772,6 +819,10 @@ def make_url(name_or_url: Union[str, URL]) -> URL:
 
     The given string is parsed according to the RFC 1738 spec.  If an
     existing URL object is passed, just returns the object.
+
+    .. seealso::
+
+        :ref:`database_urls`
 
     """
 

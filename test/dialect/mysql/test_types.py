@@ -511,8 +511,8 @@ class TypeRoundTripTest(fixtures.TestBase, AssertsExecutionResults):
         )
         t.create(connection)
         t2 = Table("foo", MetaData(), autoload_with=connection)
-        eq_(t2.kwargs["mysql_collate"], "utf8_bin")
-        eq_(t2.kwargs["mysql_default charset"], "utf8")
+        assert t2.kwargs["mysql_collate"] in ("utf8_bin", "utf8mb3_bin")
+        assert t2.kwargs["mysql_default charset"] in ("utf8", "utf8mb3")
 
         # test [ticket:2906]
         # in order to test the condition here, need to use
@@ -537,7 +537,7 @@ class TypeRoundTripTest(fixtures.TestBase, AssertsExecutionResults):
         )
         return bit_table
 
-    i, j, k, l = 255, 2 ** 32 - 1, 2 ** 63 - 1, 2 ** 64 - 1
+    i, j, k, l = 255, 2**32 - 1, 2**63 - 1, 2**64 - 1
 
     @testing.combinations(
         (([0] * 8), None),

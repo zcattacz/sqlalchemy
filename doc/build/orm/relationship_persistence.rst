@@ -58,26 +58,28 @@ be placed on just *one* of the relationships, preferably the
 many-to-one side.  Below we illustrate
 a complete example, including two :class:`_schema.ForeignKey` constructs::
 
-    from sqlalchemy import Integer, ForeignKey, Column
-    from sqlalchemy.ext.declarative import declarative_base
+    from sqlalchemy import Integer, ForeignKey
+    from sqlalchemy.orm import mapped_column
+    from sqlalchemy.orm import DeclarativeBase
     from sqlalchemy.orm import relationship
 
-    Base = declarative_base()
+    class Base(DeclarativeBase):
+        pass
 
     class Entry(Base):
         __tablename__ = 'entry'
-        entry_id = Column(Integer, primary_key=True)
-        widget_id = Column(Integer, ForeignKey('widget.widget_id'))
-        name = Column(String(50))
+        entry_id = mapped_column(Integer, primary_key=True)
+        widget_id = mapped_column(Integer, ForeignKey('widget.widget_id'))
+        name = mapped_column(String(50))
 
     class Widget(Base):
         __tablename__ = 'widget'
 
-        widget_id = Column(Integer, primary_key=True)
-        favorite_entry_id = Column(Integer,
+        widget_id = mapped_column(Integer, primary_key=True)
+        favorite_entry_id = mapped_column(Integer,
                                 ForeignKey('entry.entry_id',
                                 name="fk_favorite_entry"))
-        name = Column(String(50))
+        name = mapped_column(String(50))
 
         entries = relationship(Entry, primaryjoin=
                                         widget_id==Entry.widget_id)
@@ -116,17 +118,19 @@ that also refers to this ``Widget``.  We can use a composite foreign key,
 as illustrated below::
 
     from sqlalchemy import Integer, ForeignKey, String, \
-            Column, UniqueConstraint, ForeignKeyConstraint
-    from sqlalchemy.ext.declarative import declarative_base
+            UniqueConstraint, ForeignKeyConstraint
+    from sqlalchemy.orm import DeclarativeBase
+    from sqlalchemy.orm import mapped_column
     from sqlalchemy.orm import relationship
 
-    Base = declarative_base()
+    class Base(DeclarativeBase):
+        pass
 
     class Entry(Base):
         __tablename__ = 'entry'
-        entry_id = Column(Integer, primary_key=True)
-        widget_id = Column(Integer, ForeignKey('widget.widget_id'))
-        name = Column(String(50))
+        entry_id = mapped_column(Integer, primary_key=True)
+        widget_id = mapped_column(Integer, ForeignKey('widget.widget_id'))
+        name = mapped_column(String(50))
         __table_args__ = (
             UniqueConstraint("entry_id", "widget_id"),
         )
@@ -134,10 +138,10 @@ as illustrated below::
     class Widget(Base):
         __tablename__ = 'widget'
 
-        widget_id = Column(Integer, autoincrement='ignore_fk', primary_key=True)
-        favorite_entry_id = Column(Integer)
+        widget_id = mapped_column(Integer, autoincrement='ignore_fk', primary_key=True)
+        favorite_entry_id = mapped_column(Integer)
 
-        name = Column(String(50))
+        name = mapped_column(String(50))
 
         __table_args__ = (
             ForeignKeyConstraint(
@@ -187,8 +191,8 @@ illustrates this is::
         __tablename__ = 'user'
         __table_args__ = {'mysql_engine': 'InnoDB'}
 
-        username = Column(String(50), primary_key=True)
-        fullname = Column(String(100))
+        username = mapped_column(String(50), primary_key=True)
+        fullname = mapped_column(String(100))
 
         addresses = relationship("Address")
 
@@ -197,8 +201,8 @@ illustrates this is::
         __tablename__ = 'address'
         __table_args__ = {'mysql_engine': 'InnoDB'}
 
-        email = Column(String(50), primary_key=True)
-        username = Column(String(50),
+        email = mapped_column(String(50), primary_key=True)
+        username = mapped_column(String(50),
                     ForeignKey('user.username', onupdate="cascade")
                 )
 
@@ -247,8 +251,8 @@ Our previous mapping using ``passive_updates=False`` looks like::
     class User(Base):
         __tablename__ = 'user'
 
-        username = Column(String(50), primary_key=True)
-        fullname = Column(String(100))
+        username = mapped_column(String(50), primary_key=True)
+        fullname = mapped_column(String(100))
 
         # passive_updates=False *only* needed if the database
         # does not implement ON UPDATE CASCADE
@@ -257,8 +261,8 @@ Our previous mapping using ``passive_updates=False`` looks like::
     class Address(Base):
         __tablename__ = 'address'
 
-        email = Column(String(50), primary_key=True)
-        username = Column(String(50), ForeignKey('user.username'))
+        email = mapped_column(String(50), primary_key=True)
+        username = mapped_column(String(50), ForeignKey('user.username'))
 
 Key limitations of ``passive_updates=False`` include:
 

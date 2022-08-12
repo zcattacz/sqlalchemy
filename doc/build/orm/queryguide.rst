@@ -72,8 +72,9 @@ upon the content at :ref:`tutorial_selecting_data`.
     >>> metadata_obj.create_all(engine)
     BEGIN (implicit)
     ...
-    >>> from sqlalchemy.orm import declarative_base
-    >>> Base = declarative_base()
+    >>> from sqlalchemy.orm import DeclarativeBase
+    >>> class Base(DeclarativeBase):
+    ...     pass
     >>> from sqlalchemy.orm import relationship
     >>> class User(Base):
     ...     __table__ = user_table
@@ -256,16 +257,15 @@ allows sets of column expressions to be grouped in result rows::
     ...     Bundle("email", Address.email_address)
     ... ).join_from(User, Address)
     {sql}>>> for row in session.execute(stmt):
-    ...     print(f"{row.user.name} {row.email.email_address}")
+    ...     print(f"{row.user.name} {row.user.fullname} {row.email.email_address}")
     SELECT user_account.name, user_account.fullname, address.email_address
     FROM user_account JOIN address ON user_account.id = address.user_id
     [...] (){stop}
-    spongebob spongebob@sqlalchemy.org
-    sandy sandy@sqlalchemy.org
-    sandy squirrel@squirrelpower.org
-    patrick pat999@aol.com
-    squidward stentcl@sqlalchemy.org
-
+    spongebob Spongebob Squarepants spongebob@sqlalchemy.org
+    sandy Sandy Cheeks sandy@sqlalchemy.org
+    sandy Sandy Cheeks squirrel@squirrelpower.org
+    patrick Patrick Star pat999@aol.com
+    squidward Squidward Tentacles stentcl@sqlalchemy.org
 
 The :class:`_orm.Bundle` is potentially useful for creating lightweight
 views as well as custom column groupings such as mappings.
@@ -308,6 +308,7 @@ passed as well::
 The :class:`_orm.aliased` construct is also central to making use of subqueries
 with the ORM; the sections :ref:`orm_queryguide_subqueries` and
 :ref:`orm_queryguide_join_subqueries` discusses this further.
+
 
 .. _orm_queryguide_selecting_text:
 
@@ -490,7 +491,6 @@ and order by criteria based on its exported columns::
 .. seealso::
 
     :ref:`tutorial_orm_union` - in the :ref:`unified_tutorial`
-
 
 .. _orm_queryguide_joins:
 
@@ -1013,16 +1013,97 @@ The ``autoflush`` execution option is equvialent to the
 
 .. _orm_queryguide_yield_per:
 
-Yield Per
-^^^^^^^^^
+Fetching Large Result Sets with Yield Per
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The ``yield_per`` execution option is an integer value which will cause the
-:class:`_engine.Result` to yield only a fixed count of rows at a time.  It is
-often useful to use with a result partitioning method such as
-:meth:`_engine.Result.partitions`, e.g.::
+:class:`_engine.Result` to buffer only limited number of rows and/or ORM
+objects at a time, before making data available to the client.
+
+Normally, the ORM will construct ORM objects for **all** rows up front,
+assembling them into a single buffer, before passing this buffer to
+the :class:`_engine.Result` object as a source of rows to be returned.
+The rationale for this behavior is to allow correct behavior
+for features such as joined eager loading, uniquifying of results, and the
+general case of result handling logic that relies upon the identity map
+maintaining a consistent state for every object in a result set as it is
+fetched.
+
+The purpose of the ``yield_per`` option is to change this behavior so that the
+ORM result set is optimized for iteration through very large result sets (> 10K
+rows), where the user has determined that the above patterns don't apply. When
+``yield_per`` is used, the ORM will instead batch ORM results into
+sub-collections and yield rows from each sub-collection individually as the
+:class:`_engine.Result` object is iterated, so that the Python interpreter
+doesn't need to declare very large areas of memory which is both time consuming
+and leads to excessive memory use. The option affects both the way the database
+cursor is used as well as how the ORM constructs rows and objects to be
+passed to the :class:`_engine.Result`.
+
+.. tip::
+
+    From the above, it follows that the :class:`_engine.Result` must be
+    consumed in an iterable fashion, that is, using iteration such as
+    ``for row in result`` or using partial row methods such as
+    :meth:`_engine.Result.fetchmany` or :meth:`_engine.Result.partitions`.
+    Calling :meth:`_engine.Result.all` will defeat the purpose of using
+    ``yield_per``.
+
+Using ``yield_per`` is equivalent to making use
+of both the :paramref:`_engine.Connection.execution_options.stream_results`
+execution option, which selects for server side cursors to be used
+by the backend if supported, and the :meth:`_engine.Result.yield_per` method
+on the returned :class:`_engine.Result` object,
+which establishes a fixed size of rows to be fetched as well as a
+corresponding limit to how many ORM objects will be constructed at once.
+
+.. tip::
+
+    ``yield_per`` is now available as a Core execution option as well,
+    described in detail at :ref:`engine_stream_results`.  This section details
+    the use of ``yield_per`` as an execution option with an ORM
+    :class:`_orm.Session`.  The option behaves as similarly as possible
+    in both contexts.
+
+``yield_per`` when used with the ORM is typically established either
+via the :meth:`.Executable.execution_options` method on the given statement
+or by passing it to the :paramref:`_orm.Session.execute.execution_options`
+parameter of :meth:`_orm.Session.execute` or other similar :class:`_orm.Session`
+method.  In the example below its invoked upon a statement::
 
     >>> stmt = select(User).execution_options(yield_per=10)
-    {sql}>>> for partition in session.execute(stmt).partitions(10):
+    {sql}>>> for row in session.execute(stmt):
+    ...     print(row)
+    SELECT user_account.id, user_account.name, user_account.fullname
+    FROM user_account
+    [...] (){stop}
+    (User(id=1, name='spongebob', fullname='Spongebob Squarepants'),)
+    ...
+
+The above code is mostly equivalent as making use of the
+:paramref:`_engine.Connection.execution_options.stream_results` execution
+option, setting the :paramref:`_engine.Connection.execution_options.max_row_buffer`
+to the given integer size, and then using the :meth:`_engine.Result.yield_per`
+method on the :class:`_engine.Result` returned by the
+:class:`_orm.Session`, as in the following example::
+
+    # equivalent code
+    >>> stmt = select(User).execution_options(stream_results=True, max_row_buffer=10)
+    {sql}>>> for row in session.execute(stmt).yield_per(10):
+    ...     print(row)
+    SELECT user_account.id, user_account.name, user_account.fullname
+    FROM user_account
+    [...] (){stop}
+    (User(id=1, name='spongebob', fullname='Spongebob Squarepants'),)
+    ...
+
+``yield_per`` is also commonly used in combination with the
+:meth:`_engine.Result.partitions` method, that will iterate rows in grouped
+partitions. The size of each partition defaults to the integer value passed to
+``yield_per``, as in the below example::
+
+    >>> stmt = select(User).execution_options(yield_per=10)
+    {sql}>>> for partition in session.execute(stmt).partitions():
     ...     for row in partition:
     ...         print(row)
     SELECT user_account.id, user_account.name, user_account.fullname
@@ -1031,24 +1112,17 @@ often useful to use with a result partitioning method such as
     (User(id=1, name='spongebob', fullname='Spongebob Squarepants'),)
     ...
 
-The purpose of this method is when fetching very large result sets
-(> 10K rows), to batch results in sub-collections and yield them
-out partially, so that the Python interpreter doesn't need to declare
-very large areas of memory which is both time consuming and leads
-to excessive memory use.   The performance from fetching hundreds of
-thousands of rows can often double when a suitable yield-per setting
-(e.g. approximately 1000) is used, even with DBAPIs that buffer
-rows (which are most).
-
 When ``yield_per`` is used, the
 :paramref:`_engine.Connection.execution_options.stream_results` option is also
 set for the Core execution, so that a streaming / server side cursor will be
-used if the backend supports it [1]_
+used if the backend supports it.
 
-The ``yield_per`` execution option **is not compatible with subqueryload eager
-loading or joinedload eager loading when using collections**.  It is
-potentially compatible with selectinload eager loading, **provided the database
-driver supports multiple, independent cursors** [2]_ .
+The ``yield_per`` execution option **is not compatible** with
+:ref:`"subquery" eager loading <subquery_eager_loading>` loading or
+:ref:`"joined" eager loading <joined_eager_loading>` when using collections. It
+is potentially compatible with :ref:`"select in" eager loading
+<selectin_eager_loading>` , provided the database driver supports multiple,
+independent cursors.
 
 Additionally, the ``yield_per`` execution option is not compatible
 with the :meth:`_engine.Result.unique` method; as this method relies upon
@@ -1061,20 +1135,10 @@ large number of rows.
    :meth:`_engine.Result.unique` filter, at the same time as the ``yield_per``
    execution option is used.
 
-The ``yield_per`` execution option is equvialent to the
-:meth:`_orm.Query.yield_per` method in :term:`1.x style` ORM queries.
+When using the legacy :class:`_orm.Query` object with
+:term:`1.x style` ORM use, the :meth:`_orm.Query.yield_per` method
+will have the same result as that of the ``yield_per`` execution option.
 
-.. [1] currently known are
-   :mod:`_postgresql.psycopg2`,
-   :mod:`_mysql.mysqldb` and
-   :mod:`_mysql.pymysql`.  Other backends will pre buffer
-   all rows.  The memory use of raw database rows is much less than that of an
-   ORM-mapped object, but should still be taken into consideration when
-   benchmarking.
-
-.. [2] the :mod:`_postgresql.psycopg2`
-   and :mod:`_sqlite.pysqlite` drivers are
-   known to work, drivers for MySQL and SQL Server ODBC drivers do not.
 
 .. seealso::
 
@@ -1095,6 +1159,104 @@ matching objects locally present in the :class:`_orm.Session`. See the section
 
     >>> conn.close()
     ROLLBACK
+
+.. _queryguide_inspection:
+
+Inspecting entities and columns from ORM-enabled SELECT and DML statements
+==========================================================================
+
+The :func:`_sql.select` construct, as well as the :func:`_sql.insert`, :func:`_sql.update`
+and :func:`_sql.delete` constructs (for the latter DML constructs, as of SQLAlchemy
+1.4.33), all support the ability to inspect the entities in which these
+statements are created against, as well as the columns and datatypes that would
+be returned in a result set.
+
+For a :class:`.Select` object, this information is available from the
+:attr:`.Select.column_descriptions` attribute. This attribute operates in the
+same way as the legacy :attr:`.Query.column_descriptions` attribute. The format
+returned is a list of dictionaries::
+
+    >>> from pprint import pprint
+    >>> user_alias = aliased(User, name='user2')
+    >>> stmt = select(User, User.id, user_alias)
+    >>> pprint(stmt.column_descriptions)
+    [{'aliased': False,
+        'entity': <class 'User'>,
+        'expr': <class 'User'>,
+        'name': 'User',
+        'type': <class 'User'>},
+        {'aliased': False,
+        'entity': <class 'User'>,
+        'expr': <....InstrumentedAttribute object at ...>,
+        'name': 'id',
+        'type': Integer()},
+        {'aliased': True,
+        'entity': <AliasedClass ...; User>,
+        'expr': <AliasedClass ...; User>,
+        'name': 'user2',
+        'type': <class 'User'>}]
+
+
+When :attr:`.Select.column_descriptions` is used with non-ORM objects
+such as plain :class:`.Table` or :class:`.Column` objects, the entries
+will contain basic information about individual columns returned in all
+cases::
+
+    >>> stmt = select(user_table, address_table.c.id)
+    >>> pprint(stmt.column_descriptions)
+    [{'expr': Column('id', Integer(), table=<user_account>, primary_key=True, nullable=False),
+        'name': 'id',
+        'type': Integer()},
+        {'expr': Column('name', String(length=30), table=<user_account>),
+        'name': 'name',
+        'type': String(length=30)},
+        {'expr': Column('fullname', String(), table=<user_account>),
+        'name': 'fullname',
+        'type': String()},
+        {'expr': Column('id', Integer(), table=<address>, primary_key=True, nullable=False),
+        'name': 'id_1',
+        'type': Integer()}]
+
+.. versionchanged:: 1.4.33 The :attr:`.Select.column_descriptions` attribute now returns
+   a value when used against a :class:`.Select` that is not ORM-enabled.  Previously,
+   this would raise ``NotImplementedError``.
+
+
+For :func:`_sql.insert`, :func:`.update` and :func:`.delete` constructs, there are
+two separate attributes. One is :attr:`.UpdateBase.entity_description` which
+returns information about the primary ORM entity and database table which the
+DML construct would be affecting::
+
+    >>> from sqlalchemy import update
+    >>> stmt = update(User).values(name="somename").returning(User.id)
+    >>> pprint(stmt.entity_description)
+    {'entity': <class 'User'>,
+        'expr': <class 'User'>,
+        'name': 'User',
+        'table': Table('user_account', ...),
+        'type': <class 'User'>}
+
+.. tip::  The :attr:`.UpdateBase.entity_description` includes an entry
+   ``"table"`` which is actually the **table to be inserted, updated or
+   deleted** by the statement, which is **not** always the same as the SQL
+   "selectable" to which the class may be mapped. For example, in a
+   joined-table inheritance scenario, ``"table"`` will refer to the local table
+   for the given entity.
+
+The other is :attr:`.UpdateBase.returning_column_descriptions` which
+delivers information about the columns present in the RETURNING collection
+in a manner roughly similar to that of :attr:`.Select.column_descriptions`::
+
+    >>> pprint(stmt.returning_column_descriptions)
+    [{'aliased': False,
+        'entity': <class 'User'>,
+        'expr': <sqlalchemy.orm.attributes.InstrumentedAttribute ...>,
+        'name': 'id',
+        'type': Integer()}]
+
+.. versionadded:: 1.4.33 Added the :attr:`.UpdateBase.entity_description`
+   and :attr:`.UpdateBase.returning_column_descriptions` attributes.
+
 
 .. _queryguide_additional:
 

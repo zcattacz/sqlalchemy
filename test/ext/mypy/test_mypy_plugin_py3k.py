@@ -8,7 +8,6 @@ from typing import cast
 from typing import List
 from typing import Tuple
 
-import sqlalchemy
 from sqlalchemy import testing
 from sqlalchemy.testing import config
 from sqlalchemy.testing import eq_
@@ -63,20 +62,8 @@ class MypyPluginTest(fixtures.TestBase):
             yield item
 
     def _cachedir(self):
-        sqlalchemy_path = os.path.dirname(os.path.dirname(sqlalchemy.__file__))
-
-        # for a pytest from my local ./lib/ , i need mypy_path.
-        # for a tox run where sqlalchemy is in site_packages, mypy complains
-        # "../python3.10/site-packages is in the MYPYPATH. Please remove it."
-        # previously when we used sqlalchemy2-stubs, it would just be
-        # installed as a dependency, which is why mypy_path wasn't needed
-        # then, but I like to be able to run the test suite from the local
-        # ./lib/ as well.
-
-        if "site-packages" not in sqlalchemy_path:
-            mypy_path = f"mypy_path={sqlalchemy_path}"
-        else:
-            mypy_path = ""
+        # as of mypy 0.971 i think we need to keep mypy_path empty
+        mypy_path = ""
 
         with tempfile.TemporaryDirectory() as cachedir:
             with open(
@@ -132,7 +119,8 @@ class MypyPluginTest(fixtures.TestBase):
 
             args.append(path)
 
-            return api.run(args)
+            result = api.run(args)
+            return result
 
         return run
 
@@ -231,8 +219,43 @@ class MypyPluginTest(fixtures.TestBase):
                     is_re = bool(m.group(2))
                     is_type = bool(m.group(3))
 
-                    expected_msg = re.sub(r"# noqa ?.*", "", m.group(4))
+                    expected_msg = re.sub(r"# noqa[:]? ?.*", "", m.group(4))
                     if is_type:
+                        if not is_re:
+                            # the goal here is that we can cut-and-paste
+                            # from vscode -> pylance into the
+                            # EXPECTED_TYPE: line, then the test suite will
+                            # validate that line against what mypy produces
+                            expected_msg = re.sub(
+                                r"([\[\]])",
+                                lambda m: rf"\{m.group(0)}",
+                                expected_msg,
+                            )
+
+                            # note making sure preceding text matches
+                            # with a dot, so that an expect for "Select"
+                            # does not match "TypedSelect"
+                            expected_msg = re.sub(
+                                r"([\w_]+)",
+                                lambda m: rf"(?:.*\.)?{m.group(1)}\*?",
+                                expected_msg,
+                            )
+
+                            expected_msg = re.sub(
+                                "List", "builtins.list", expected_msg
+                            )
+
+                            expected_msg = re.sub(
+                                r"\b(int|str|float|bool)\b",
+                                lambda m: rf"builtins.{m.group(0)}\*?",
+                                expected_msg,
+                            )
+                            # expected_msg = re.sub(
+                            #     r"(Sequence|Tuple|List|Union)",
+                            #     lambda m: fr"typing.{m.group(0)}\*?",
+                            #     expected_msg,
+                            # )
+
                         is_mypy = is_re = True
                         expected_msg = f'Revealed type is "{expected_msg}"'
                     current_assert_messages.append(
@@ -250,6 +273,8 @@ class MypyPluginTest(fixtures.TestBase):
                     current_assert_messages[:] = []
 
         result = mypy_runner(path, use_plugin=use_plugin)
+
+        not_located = []
 
         if expected_messages:
             eq_(result[2], 1, msg=result)
@@ -281,7 +306,7 @@ class MypyPluginTest(fixtures.TestBase):
                 for idx, (typ, errmsg) in enumerate(output):
                     if is_re:
                         if re.match(
-                            fr".*{filename}\:{num}\: {typ}\: {prefix}{msg}",  # noqa E501
+                            rf".*{filename}\:{num}\: {typ}\: {prefix}{msg}",  # noqa: E501
                             errmsg,
                         ):
                             break
@@ -291,11 +316,17 @@ class MypyPluginTest(fixtures.TestBase):
                     ):
                         break
                 else:
+                    not_located.append(msg)
                     continue
                 del output[idx]
 
+            if not_located:
+                print(f"Couldn't locate expected messages: {not_located}")
+                print("\n".join(msg for _, msg in output))
+                assert False, "expected messages not found, see stdout"
+
             if output:
-                print("messages from mypy that were not consumed:")
+                print(f"{len(output)} messages from mypy were not consumed:")
                 print("\n".join(msg for _, msg in output))
                 assert False, "errors and/or notes remain, see stdout"
 

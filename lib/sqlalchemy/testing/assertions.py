@@ -4,6 +4,8 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: ignore-errors
+
 
 from __future__ import annotations
 
@@ -642,13 +644,21 @@ class AssertsCompiledSQL:
 
 
 class ComparesTables:
-    def assert_tables_equal(self, table, reflected_table, strict_types=False):
+    def assert_tables_equal(
+        self,
+        table,
+        reflected_table,
+        strict_types=False,
+        strict_constraints=True,
+    ):
         assert len(table.c) == len(reflected_table.c)
         for c, reflected_c in zip(table.c, reflected_table.c):
             eq_(c.name, reflected_c.name)
             assert reflected_c is reflected_table.c[c.name]
-            eq_(c.primary_key, reflected_c.primary_key)
-            eq_(c.nullable, reflected_c.nullable)
+
+            if strict_constraints:
+                eq_(c.primary_key, reflected_c.primary_key)
+                eq_(c.nullable, reflected_c.nullable)
 
             if strict_types:
                 msg = "Type '%s' doesn't correspond to type '%s'"
@@ -662,18 +672,20 @@ class ComparesTables:
             if isinstance(c.type, sqltypes.String):
                 eq_(c.type.length, reflected_c.type.length)
 
-            eq_(
-                {f.column.name for f in c.foreign_keys},
-                {f.column.name for f in reflected_c.foreign_keys},
-            )
+            if strict_constraints:
+                eq_(
+                    {f.column.name for f in c.foreign_keys},
+                    {f.column.name for f in reflected_c.foreign_keys},
+                )
             if c.server_default:
                 assert isinstance(
                     reflected_c.server_default, schema.FetchedValue
                 )
 
-        assert len(table.primary_key) == len(reflected_table.primary_key)
-        for c in table.primary_key:
-            assert reflected_table.primary_key.columns[c.name] is not None
+        if strict_constraints:
+            assert len(table.primary_key) == len(reflected_table.primary_key)
+            for c in table.primary_key:
+                assert reflected_table.primary_key.columns[c.name] is not None
 
     def assert_types_base(self, c1, c2):
         assert c1.type._compare_type_affinity(
@@ -799,7 +811,7 @@ class AssertsExecutionResults:
         return self.assert_sql_execution(db, callable_, *newrules)
 
     def assert_sql_count(self, db, callable_, count):
-        self.assert_sql_execution(
+        return self.assert_sql_execution(
             db, callable_, assertsql.CountStatements(count)
         )
 
@@ -826,3 +838,34 @@ class AssertsExecutionResults:
 
     def assert_statement_count(self, db, count):
         return self.assert_execution(db, assertsql.CountStatements(count))
+
+
+class ComparesIndexes:
+    def compare_table_index_with_expected(
+        self, table: schema.Table, expected: list, dialect_name: str
+    ):
+        eq_(len(table.indexes), len(expected))
+        idx_dict = {idx.name: idx for idx in table.indexes}
+        for exp in expected:
+            idx = idx_dict[exp["name"]]
+            eq_(idx.unique, exp["unique"])
+            cols = [c for c in exp["column_names"] if c is not None]
+            eq_(len(idx.columns), len(cols))
+            for c in cols:
+                is_true(c in idx.columns)
+            exprs = exp.get("expressions")
+            if exprs:
+                eq_(len(idx.expressions), len(exprs))
+                for idx_exp, expr, col in zip(
+                    idx.expressions, exprs, exp["column_names"]
+                ):
+                    if col is None:
+                        eq_(idx_exp.text, expr)
+            if (
+                exp.get("dialect_options")
+                and f"{dialect_name}_include" in exp["dialect_options"]
+            ):
+                eq_(
+                    idx.dialect_options[dialect_name]["include"],
+                    exp["dialect_options"][f"{dialect_name}_include"],
+                )

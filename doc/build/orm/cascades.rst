@@ -22,7 +22,7 @@ Cascade behavior is configured using the
 :func:`~sqlalchemy.orm.relationship`::
 
     class Order(Base):
-        __tablename__ = 'order'
+        __tablename__ = "order"
 
         items = relationship("Item", cascade="all, delete-orphan")
         customer = relationship("User", cascade="save-update")
@@ -32,11 +32,11 @@ To set cascades on a backref, the same flag can be used with the
 its arguments back into :func:`~sqlalchemy.orm.relationship`::
 
     class Item(Base):
-        __tablename__ = 'item'
+        __tablename__ = "item"
 
-        order = relationship("Order",
-                        backref=backref("items", cascade="all, delete-orphan")
-                    )
+        order = relationship(
+            "Order", backref=backref("items", cascade="all, delete-orphan")
+        )
 
 .. sidebar:: The Origins of Cascade
 
@@ -122,6 +122,8 @@ for granted; it simplifies code by allowing a single call to
 that :class:`.Session` at once.   While it can be disabled, there
 is usually not a need to do so.
 
+.. _back_populates_cascade:
+
 .. _backref_cascade:
 
 Behavior of save-update cascade with bi-directional relationships
@@ -129,7 +131,8 @@ Behavior of save-update cascade with bi-directional relationships
 
 The ``save-update`` cascade takes place **uni-directionally** in the context of
 a bi-directional relationship, i.e. when using
-:ref:`backref / back_populates <relationships_backref>` to create two separate
+the :paramref:`_orm.relationship.back_populates` or :paramref:`_orm.relationship.backref`
+parameters to create two separate
 :func:`_orm.relationship` objects which refer to each other.
 
 An object that's not associated with a :class:`_orm.Session`, when assigned to
@@ -147,13 +150,17 @@ To illustrate, given a mapping of ``Order`` objects which relate
 bi-directionally to a series of ``Item`` objects via relationships
 ``Order.items`` and ``Item.order``::
 
-    mapper_registry.map_imperatively(Order, order_table, properties={
-        'items' : relationship(Item, back_populates='order')
-    })
+    mapper_registry.map_imperatively(
+        Order,
+        order_table,
+        properties={"items": relationship(Item, back_populates="order")},
+    )
 
-    mapper_registry.map_imperatively(Item, item_table, properties={
-        'order' : relationship(Order, back_populates='items')
-    })
+    mapper_registry.map_imperatively(
+        Item,
+        item_table,
+        properties={"order": relationship(Order, back_populates="items")},
+    )
 
 If an ``Order`` is already associated with a :class:`_orm.Session`, and
 an ``Item`` object is then created and appended to the ``Order.items``
@@ -319,24 +326,28 @@ The following example adapts that of :ref:`relationships_many_to_many` to
 illustrate the ``cascade="all, delete"`` setting on **one** side of the
 association::
 
-    association_table = Table('association', Base.metadata,
-        Column('left_id', Integer, ForeignKey('left.id')),
-        Column('right_id', Integer, ForeignKey('right.id'))
+    association_table = Table(
+        "association",
+        Base.metadata,
+        Column("left_id", Integer, ForeignKey("left.id")),
+        Column("right_id", Integer, ForeignKey("right.id")),
     )
 
+
     class Parent(Base):
-        __tablename__ = 'left'
-        id = Column(Integer, primary_key=True)
+        __tablename__ = "left"
+        id = mapped_column(Integer, primary_key=True)
         children = relationship(
             "Child",
             secondary=association_table,
             back_populates="parents",
-            cascade="all, delete"
+            cascade="all, delete",
         )
 
+
     class Child(Base):
-        __tablename__ = 'right'
-        id = Column(Integer, primary_key=True)
+        __tablename__ = "right"
+        id = mapped_column(Integer, primary_key=True)
         parents = relationship(
             "Parent",
             secondary=association_table,
@@ -398,18 +409,20 @@ on the relevant ``FOREIGN KEY`` constraint as well::
 
 
     class Parent(Base):
-        __tablename__ = 'parent'
-        id = Column(Integer, primary_key=True)
+        __tablename__ = "parent"
+        id = mapped_column(Integer, primary_key=True)
         children = relationship(
-            "Child", back_populates="parent",
+            "Child",
+            back_populates="parent",
             cascade="all, delete",
-            passive_deletes=True
+            passive_deletes=True,
         )
 
+
     class Child(Base):
-        __tablename__ = 'child'
-        id = Column(Integer, primary_key=True)
-        parent_id = Column(Integer, ForeignKey('parent.id', ondelete="CASCADE"))
+        __tablename__ = "child"
+        id = mapped_column(Integer, primary_key=True)
+        parent_id = mapped_column(Integer, ForeignKey("parent.id", ondelete="CASCADE"))
         parent = relationship("Parent", back_populates="children")
 
 The behavior of the above configuration when a parent row is deleted
@@ -548,14 +561,17 @@ on the parent->child side of the relationship, and we can then configure
 ``passive_deletes=True`` on the **other** side of the bidirectional
 relationship as illustrated below::
 
-    association_table = Table('association', Base.metadata,
-        Column('left_id', Integer, ForeignKey('left.id', ondelete="CASCADE")),
-        Column('right_id', Integer, ForeignKey('right.id', ondelete="CASCADE"))
+    association_table = Table(
+        "association",
+        Base.metadata,
+        Column("left_id", Integer, ForeignKey("left.id", ondelete="CASCADE")),
+        Column("right_id", Integer, ForeignKey("right.id", ondelete="CASCADE")),
     )
 
+
     class Parent(Base):
-        __tablename__ = 'left'
-        id = Column(Integer, primary_key=True)
+        __tablename__ = "left"
+        id = mapped_column(Integer, primary_key=True)
         children = relationship(
             "Child",
             secondary=association_table,
@@ -563,14 +579,15 @@ relationship as illustrated below::
             cascade="all, delete",
         )
 
+
     class Child(Base):
-        __tablename__ = 'right'
-        id = Column(Integer, primary_key=True)
+        __tablename__ = "right"
+        id = mapped_column(Integer, primary_key=True)
         parents = relationship(
             "Parent",
             secondary=association_table,
             back_populates="children",
-            passive_deletes=True
+            passive_deletes=True,
         )
 
 Using the above configuration, the deletion of a ``Parent`` object proceeds
@@ -712,12 +729,11 @@ parent collection.  The ``delete-orphan`` cascade accomplishes this, as
 illustrated in the example below::
 
     class User(Base):
-        __tablename__ = 'user'
+        __tablename__ = "user"
 
         # ...
 
-        addresses = relationship(
-            "Address", cascade="all, delete-orphan")
+        addresses = relationship("Address", cascade="all, delete-orphan")
 
     # ...
 
@@ -739,9 +755,8 @@ that this related object is not to shared with any other parent simultaneously::
         # ...
 
         preference = relationship(
-            "Preference", cascade="all, delete-orphan",
-            single_parent=True)
-
+            "Preference", cascade="all, delete-orphan", single_parent=True
+        )
 
 Above, if a hypothetical ``Preference`` object is removed from a ``User``,
 it will be deleted on flush::

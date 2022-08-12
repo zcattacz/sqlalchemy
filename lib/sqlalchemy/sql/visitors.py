@@ -21,15 +21,16 @@ from typing import Any
 from typing import Callable
 from typing import cast
 from typing import ClassVar
-from typing import Collection
 from typing import Dict
 from typing import Iterable
 from typing import Iterator
 from typing import List
 from typing import Mapping
 from typing import Optional
+from typing import overload
 from typing import Tuple
 from typing import Type
+from typing import TYPE_CHECKING
 from typing import TypeVar
 from typing import Union
 
@@ -37,15 +38,24 @@ from .. import exc
 from .. import util
 from ..util import langhelpers
 from ..util._has_cy import HAS_CYEXTENSION
+from ..util.typing import Literal
 from ..util.typing import Protocol
 from ..util.typing import Self
+
+if TYPE_CHECKING:
+    from .annotation import _AnnotationDict
+    from .elements import ColumnElement
 
 if typing.TYPE_CHECKING or not HAS_CYEXTENSION:
     from ._py_util import prefix_anon_map as prefix_anon_map
     from ._py_util import cache_anon_map as anon_map
 else:
-    from sqlalchemy.cyextension.util import prefix_anon_map as prefix_anon_map
-    from sqlalchemy.cyextension.util import cache_anon_map as anon_map
+    from sqlalchemy.cyextension.util import (  # noqa: F401,E501
+        prefix_anon_map as prefix_anon_map,
+    )
+    from sqlalchemy.cyextension.util import (  # noqa: F401,E501
+        cache_anon_map as anon_map,
+    )
 
 
 __all__ = [
@@ -128,9 +138,9 @@ class Visitable:
             try:
                 meth = getter(visitor)
             except AttributeError as err:
-                return visitor.visit_unsupported_compilation(self, err, **kw)  # type: ignore  # noqa E501
+                return visitor.visit_unsupported_compilation(self, err, **kw)  # type: ignore  # noqa: E501
             else:
-                return meth(self, **kw)  # type: ignore  # noqa E501
+                return meth(self, **kw)  # type: ignore  # noqa: E501
 
         cls._compiler_dispatch = (  # type: ignore
             cls._original_compiler_dispatch
@@ -444,9 +454,11 @@ class HasTraverseInternals:
 
     _traverse_internals: _TraverseInternalsType
 
+    _is_immutable: bool = False
+
     @util.preload_module("sqlalchemy.sql.traversals")
     def get_children(
-        self, omit_attrs: Tuple[str, ...] = (), **kw: Any
+        self, *, omit_attrs: Tuple[str, ...] = (), **kw: Any
     ) -> Iterable[HasTraverseInternals]:
         r"""Return immediate child :class:`.visitors.HasTraverseInternals`
         elements of this :class:`.visitors.HasTraverseInternals`.
@@ -582,15 +594,25 @@ _dispatch_lookup = HasTraversalDispatch._dispatch_lookup
 _generate_traversal_dispatch()
 
 
+SelfExternallyTraversible = TypeVar(
+    "SelfExternallyTraversible", bound="ExternallyTraversible"
+)
+
+
 class ExternallyTraversible(HasTraverseInternals, Visitable):
     __slots__ = ()
 
-    _annotations: Collection[Any] = ()
+    _annotations: Mapping[Any, Any] = util.EMPTY_DICT
 
     if typing.TYPE_CHECKING:
 
+        def _annotate(
+            self: SelfExternallyTraversible, values: _AnnotationDict
+        ) -> SelfExternallyTraversible:
+            ...
+
         def get_children(
-            self, omit_attrs: Tuple[str, ...] = (), **kw: Any
+            self, *, omit_attrs: Tuple[str, ...] = (), **kw: Any
         ) -> Iterable[ExternallyTraversible]:
             ...
 
@@ -599,8 +621,8 @@ class ExternallyTraversible(HasTraverseInternals, Visitable):
         raise NotImplementedError()
 
     def _copy_internals(
-        self: Self, omit_attrs: Tuple[str, ...] = (), **kw: Any
-    ) -> Self:
+        self, *, omit_attrs: Tuple[str, ...] = (), **kw: Any
+    ) -> None:
         """Reassign internal elements to be clones of themselves.
 
         Called during a copy-and-traverse operation on newly
@@ -615,10 +637,23 @@ class ExternallyTraversible(HasTraverseInternals, Visitable):
 
 
 _ET = TypeVar("_ET", bound=ExternallyTraversible)
+
+_CE = TypeVar("_CE", bound="ColumnElement[Any]")
+
 _TraverseCallableType = Callable[[_ET], None]
-_TraverseTransformCallableType = Callable[
-    [ExternallyTraversible], Optional[ExternallyTraversible]
-]
+
+
+class _CloneCallableType(Protocol):
+    def __call__(self, element: _ET, **kw: Any) -> _ET:
+        ...
+
+
+class _TraverseTransformCallableType(Protocol[_ET]):
+    def __call__(self, element: _ET, **kw: Any) -> Optional[_ET]:
+        ...
+
+
+_ExtT = TypeVar("_ExtT", bound="ExternalTraversal")
 
 
 class ExternalTraversal:
@@ -640,7 +675,7 @@ class ExternalTraversal:
                 return meth(obj, **kw)
 
     def iterate(
-        self, obj: ExternallyTraversible
+        self, obj: Optional[ExternallyTraversible]
     ) -> Iterator[ExternallyTraversible]:
         """Traverse the given expression structure, returning an iterator
         of all elements.
@@ -648,7 +683,17 @@ class ExternalTraversal:
         """
         return iterate(obj, self.__traverse_options__)
 
+    @overload
+    def traverse(self, obj: Literal[None]) -> None:
+        ...
+
+    @overload
     def traverse(self, obj: ExternallyTraversible) -> ExternallyTraversible:
+        ...
+
+    def traverse(
+        self, obj: Optional[ExternallyTraversible]
+    ) -> Optional[ExternallyTraversible]:
         """Traverse and visit the given expression structure."""
 
         return traverse(obj, self.__traverse_options__, self._visitor_dict)
@@ -671,7 +716,7 @@ class ExternalTraversal:
             yield v
             v = getattr(v, "_next", None)
 
-    def chain(self, visitor: ExternalTraversal) -> ExternalTraversal:
+    def chain(self: _ExtT, visitor: ExternalTraversal) -> _ExtT:
         """'Chain' an additional ExternalTraversal onto this ExternalTraversal
 
         The chained visitor will receive all visit events after this one.
@@ -701,7 +746,17 @@ class CloningExternalTraversal(ExternalTraversal):
         """
         return [self.traverse(x) for x in list_]
 
+    @overload
+    def traverse(self, obj: Literal[None]) -> None:
+        ...
+
+    @overload
     def traverse(self, obj: ExternallyTraversible) -> ExternallyTraversible:
+        ...
+
+    def traverse(
+        self, obj: Optional[ExternallyTraversible]
+    ) -> Optional[ExternallyTraversible]:
         """Traverse and visit the given expression structure."""
 
         return cloned_traverse(
@@ -729,14 +784,25 @@ class ReplacingExternalTraversal(CloningExternalTraversal):
         """
         return None
 
+    @overload
+    def traverse(self, obj: Literal[None]) -> None:
+        ...
+
+    @overload
     def traverse(self, obj: ExternallyTraversible) -> ExternallyTraversible:
+        ...
+
+    def traverse(
+        self, obj: Optional[ExternallyTraversible]
+    ) -> Optional[ExternallyTraversible]:
         """Traverse and visit the given expression structure."""
 
         def replace(
-            elem: ExternallyTraversible,
+            element: ExternallyTraversible,
+            **kw: Any,
         ) -> Optional[ExternallyTraversible]:
             for v in self.visitor_iterator:
-                e = cast(ReplacingExternalTraversal, v).replace(elem)
+                e = cast(ReplacingExternalTraversal, v).replace(element)
                 if e is not None:
                     return e
 
@@ -754,7 +820,8 @@ ReplacingCloningVisitor = ReplacingExternalTraversal
 
 
 def iterate(
-    obj: ExternallyTraversible, opts: Mapping[str, Any] = util.EMPTY_DICT
+    obj: Optional[ExternallyTraversible],
+    opts: Mapping[str, Any] = util.EMPTY_DICT,
 ) -> Iterator[ExternallyTraversible]:
     r"""Traverse the given expression structure, returning an iterator.
 
@@ -776,6 +843,9 @@ def iterate(
      empty in modern usage.
 
     """
+    if obj is None:
+        return
+
     yield obj
     children = obj.get_children(**opts)
 
@@ -790,11 +860,29 @@ def iterate(
             stack.append(t.get_children(**opts))
 
 
+@overload
+def traverse_using(
+    iterator: Iterable[ExternallyTraversible],
+    obj: Literal[None],
+    visitors: Mapping[str, _TraverseCallableType[Any]],
+) -> None:
+    ...
+
+
+@overload
 def traverse_using(
     iterator: Iterable[ExternallyTraversible],
     obj: ExternallyTraversible,
     visitors: Mapping[str, _TraverseCallableType[Any]],
 ) -> ExternallyTraversible:
+    ...
+
+
+def traverse_using(
+    iterator: Iterable[ExternallyTraversible],
+    obj: Optional[ExternallyTraversible],
+    visitors: Mapping[str, _TraverseCallableType[Any]],
+) -> Optional[ExternallyTraversible]:
     """Visit the given expression structure using the given iterator of
     objects.
 
@@ -826,11 +914,29 @@ def traverse_using(
     return obj
 
 
+@overload
+def traverse(
+    obj: Literal[None],
+    opts: Mapping[str, Any],
+    visitors: Mapping[str, _TraverseCallableType[Any]],
+) -> None:
+    ...
+
+
+@overload
 def traverse(
     obj: ExternallyTraversible,
     opts: Mapping[str, Any],
     visitors: Mapping[str, _TraverseCallableType[Any]],
 ) -> ExternallyTraversible:
+    ...
+
+
+def traverse(
+    obj: Optional[ExternallyTraversible],
+    opts: Mapping[str, Any],
+    visitors: Mapping[str, _TraverseCallableType[Any]],
+) -> Optional[ExternallyTraversible]:
     """Traverse and visit the given expression structure using the default
     iterator.
 
@@ -863,17 +969,53 @@ def traverse(
     return traverse_using(iterate(obj, opts), obj, visitors)
 
 
+@overload
 def cloned_traverse(
-    obj: ExternallyTraversible,
+    obj: Literal[None],
     opts: Mapping[str, Any],
     visitors: Mapping[str, _TraverseCallableType[Any]],
-) -> ExternallyTraversible:
+) -> None:
+    ...
+
+
+# a bit of controversy here, as the clone of the lead element
+# *could* in theory replace with an entirely different kind of element.
+# however this is really not how cloned_traverse is ever used internally
+# at least.
+@overload
+def cloned_traverse(
+    obj: _ET,
+    opts: Mapping[str, Any],
+    visitors: Mapping[str, _TraverseCallableType[Any]],
+) -> _ET:
+    ...
+
+
+def cloned_traverse(
+    obj: Optional[ExternallyTraversible],
+    opts: Mapping[str, Any],
+    visitors: Mapping[str, _TraverseCallableType[Any]],
+) -> Optional[ExternallyTraversible]:
     """Clone the given expression structure, allowing modifications by
-    visitors.
+    visitors for mutable objects.
 
     Traversal usage is the same as that of :func:`.visitors.traverse`.
     The visitor functions present in the ``visitors`` dictionary may also
     modify the internals of the given structure as the traversal proceeds.
+
+    The :func:`.cloned_traverse` function does **not** provide objects that are
+    part of the :class:`.Immutable` interface to the visit methods (this
+    primarily includes :class:`.ColumnClause`, :class:`.Column`,
+    :class:`.TableClause` and :class:`.Table` objects). As this traversal is
+    only intended to allow in-place mutation of objects, :class:`.Immutable`
+    objects are skipped. The :meth:`.Immutable._clone` method is still called
+    on each object to allow for objects to replace themselves with a different
+    object based on a clone of their sub-internals (e.g. a
+    :class:`.ColumnClause` that clones its subquery to return a new
+    :class:`.ColumnClause`).
+
+    .. versionchanged:: 2.0  The :func:`.cloned_traverse` function omits
+       objects that are part of the :class:`.Immutable` interface.
 
     The central API feature used by the :func:`.visitors.cloned_traverse`
     and :func:`.visitors.replacement_traverse` functions, in addition to the
@@ -916,11 +1058,21 @@ def cloned_traverse(
                         cloned[id(elem)] = newelem
                         return newelem
 
+                # the _clone method for immutable normally returns "self".
+                # however, the method is still allowed to return a
+                # different object altogether; ColumnClause._clone() will
+                # based on options clone the subquery to which it is associated
+                # and return the new corresponding column.
                 cloned[id(elem)] = newelem = elem._clone(clone=clone, **kw)
                 newelem._copy_internals(clone=clone, **kw)
-                meth = visitors.get(newelem.__visit_name__, None)
-                if meth:
-                    meth(newelem)
+
+                # however, visit methods which are tasked with in-place
+                # mutation of the object should not get access to the immutable
+                # object.
+                if not elem._is_immutable:
+                    meth = visitors.get(newelem.__visit_name__, None)
+                    if meth:
+                        meth(newelem)
             return cloned[id(elem)]
 
     if obj is not None:
@@ -931,11 +1083,38 @@ def cloned_traverse(
     return obj
 
 
+@overload
+def replacement_traverse(
+    obj: Literal[None],
+    opts: Mapping[str, Any],
+    replace: _TraverseTransformCallableType[Any],
+) -> None:
+    ...
+
+
+@overload
+def replacement_traverse(
+    obj: _CE,
+    opts: Mapping[str, Any],
+    replace: _TraverseTransformCallableType[Any],
+) -> _CE:
+    ...
+
+
+@overload
 def replacement_traverse(
     obj: ExternallyTraversible,
     opts: Mapping[str, Any],
-    replace: _TraverseTransformCallableType,
+    replace: _TraverseTransformCallableType[Any],
 ) -> ExternallyTraversible:
+    ...
+
+
+def replacement_traverse(
+    obj: Optional[ExternallyTraversible],
+    opts: Mapping[str, Any],
+    replace: _TraverseTransformCallableType[Any],
+) -> Optional[ExternallyTraversible]:
     """Clone the given expression structure, allowing element
     replacement by a given replacement function.
 
@@ -977,7 +1156,7 @@ def replacement_traverse(
             newelem = replace(elem)
             if newelem is not None:
                 stop_on.add(id(newelem))
-                return newelem
+                return newelem  # type: ignore
             else:
                 # base "already seen" on id(), not hash, so that we don't
                 # replace an Annotated element with its non-annotated one, and
@@ -988,11 +1167,11 @@ def replacement_traverse(
                         newelem = kw["replace"](elem)
                         if newelem is not None:
                             cloned[id_elem] = newelem
-                            return newelem
+                            return newelem  # type: ignore
 
                     cloned[id_elem] = newelem = elem._clone(**kw)
                     newelem._copy_internals(clone=clone, **kw)
-                return cloned[id_elem]
+                return cloned[id_elem]  # type: ignore
 
     if obj is not None:
         obj = clone(

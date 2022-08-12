@@ -4,6 +4,8 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: ignore-errors
+
 
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ from .. import event
 from .. import util
 from ..orm import declarative_base
 from ..orm import DeclarativeBase
+from ..orm import MappedAsDataclass
 from ..orm import registry
 from ..schema import sort_tables_and_constraints
 
@@ -50,6 +53,13 @@ class TestBase:
 
     def assert_(self, val, msg=None):
         assert val, msg
+
+    @config.fixture()
+    def nocache(self):
+        _cache = config.db._compiled_cache
+        config.db._compiled_cache = None
+        yield
+        config.db._compiled_cache = _cache
 
     @config.fixture()
     def connection_no_trans(self):
@@ -80,8 +90,37 @@ class TestBase:
         conn.close()
 
     @config.fixture()
+    def close_result_when_finished(self):
+        to_close = []
+        to_consume = []
+
+        def go(result, consume=False):
+            to_close.append(result)
+            if consume:
+                to_consume.append(result)
+
+        yield go
+        for r in to_consume:
+            try:
+                r.all()
+            except:
+                pass
+        for r in to_close:
+            try:
+                r.close()
+            except:
+                pass
+
+    @config.fixture()
     def registry(self, metadata):
-        reg = registry(metadata=metadata)
+        reg = registry(
+            metadata=metadata,
+            type_annotation_map={
+                str: sa.String().with_variant(
+                    sa.String(50), "mysql", "mariadb"
+                )
+            },
+        )
         yield reg
         reg.dispose()
 
@@ -90,6 +129,21 @@ class TestBase:
         _md = metadata
 
         class Base(DeclarativeBase):
+            metadata = _md
+            type_annotation_map = {
+                str: sa.String().with_variant(
+                    sa.String(50), "mysql", "mariadb"
+                )
+            }
+
+        yield Base
+        Base.registry.dispose()
+
+    @config.fixture
+    def dc_decl_base(self, metadata):
+        _md = metadata
+
+        class Base(MappedAsDataclass, DeclarativeBase):
             metadata = _md
             type_annotation_map = {
                 str: sa.String().with_variant(
@@ -121,6 +175,7 @@ class TestBase:
             future=None,
             asyncio=False,
             transfer_staticpool=False,
+            share_pool=False,
         ):
             if options is None:
                 options = {}
@@ -130,6 +185,7 @@ class TestBase:
                 options=options,
                 asyncio=asyncio,
                 transfer_staticpool=transfer_staticpool,
+                share_pool=share_pool,
             )
 
         yield gen_testing_engine
@@ -143,6 +199,10 @@ class TestBase:
             return testing_engine(**kw)
 
         return go
+
+    @config.fixture
+    def fixture_session(self):
+        return fixture_session()
 
     @config.fixture()
     def metadata(self, request):
@@ -427,6 +487,10 @@ class TablesTest(TestBase):
         elif self.run_create_tables == "each":
             drop_all_tables_from_metadata(self._tables_metadata, self.bind)
 
+        savepoints = getattr(config.requirements, "savepoints", False)
+        if savepoints:
+            savepoints = savepoints.enabled
+
         # no need to run deletes if tables are recreated on setup
         if (
             self.run_define_tables != "each"
@@ -444,7 +508,11 @@ class TablesTest(TestBase):
                     ]
                 ):
                     try:
-                        conn.execute(table.delete())
+                        if savepoints:
+                            with conn.begin_nested():
+                                conn.execute(table.delete())
+                        else:
+                            conn.execute(table.delete())
                     except sa.exc.DBAPIError as ex:
                         print(
                             ("Error emptying table %s: %r" % (table, ex)),

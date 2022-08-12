@@ -3,6 +3,7 @@ import pickle
 
 import sqlalchemy as tsa
 from sqlalchemy import ARRAY
+from sqlalchemy import BigInteger
 from sqlalchemy import bindparam
 from sqlalchemy import BLANK_SCHEMA
 from sqlalchemy import Boolean
@@ -10,6 +11,7 @@ from sqlalchemy import CheckConstraint
 from sqlalchemy import Column
 from sqlalchemy import column
 from sqlalchemy import ColumnDefault
+from sqlalchemy import Computed
 from sqlalchemy import desc
 from sqlalchemy import Enum
 from sqlalchemy import event
@@ -17,11 +19,14 @@ from sqlalchemy import exc
 from sqlalchemy import ForeignKey
 from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy import func
+from sqlalchemy import Identity
 from sqlalchemy import Index
 from sqlalchemy import Integer
 from sqlalchemy import MetaData
+from sqlalchemy import Numeric
 from sqlalchemy import PrimaryKeyConstraint
 from sqlalchemy import schema
+from sqlalchemy import select
 from sqlalchemy import Sequence
 from sqlalchemy import String
 from sqlalchemy import Table
@@ -41,6 +46,7 @@ from sqlalchemy.sql import naming
 from sqlalchemy.sql import operators
 from sqlalchemy.sql.elements import _NONE_NAME
 from sqlalchemy.sql.elements import literal_column
+from sqlalchemy.sql.schema import RETAIN_SCHEMA
 from sqlalchemy.testing import assert_raises
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import AssertsCompiledSQL
@@ -235,6 +241,7 @@ class MetaDataTest(fixtures.TestBase, ComparesTables):
             deferrable="Z",
             initially="Q",
             link_to_name=True,
+            comment="foo",
         )
 
         fk1 = ForeignKey(c1, **kw)
@@ -257,6 +264,7 @@ class MetaDataTest(fixtures.TestBase, ComparesTables):
             name="name",
             initially=True,
             deferrable=True,
+            comment="foo",
             _create_rule=r,
         )
         c2 = c._copy()
@@ -264,6 +272,7 @@ class MetaDataTest(fixtures.TestBase, ComparesTables):
         eq_(str(c2.sqltext), "foo bar")
         eq_(c2.initially, True)
         eq_(c2.deferrable, True)
+        eq_(c2.comment, "foo")
         assert c2._create_rule is r
 
     def test_col_replace_w_constraint(self):
@@ -760,7 +769,10 @@ class MetaDataTest(fixtures.TestBase, ComparesTables):
                 "%s"
                 ", name='someconstraint')" % repr(ck.sqltext),
             ),
-            (ColumnDefault(("foo", "bar")), "ColumnDefault(('foo', 'bar'))"),
+            (
+                ColumnDefault(("foo", "bar")),
+                "ScalarElementColumnDefault(('foo', 'bar'))",
+            ),
         ):
             eq_(repr(const), exp)
 
@@ -915,6 +927,46 @@ class ToMetaDataTest(fixtures.TestBase, AssertsCompiledSQL, ComparesTables):
         b2 = b.to_metadata(m2)
         a2 = a.to_metadata(m2)
         assert b2.c.y.references(a2.c.x)
+
+    def test_fk_w_no_colname(self):
+        """test a ForeignKey that refers to table name only.  the column
+        name is assumed to be the same col name on parent table.
+
+        this is a little used feature from long ago that nonetheless is
+        still in the code.
+
+        The feature was found to be not working but is repaired for
+        SQLAlchemy 2.0.
+
+        """
+        m1 = MetaData()
+        a = Table("a", m1, Column("x", Integer))
+        b = Table("b", m1, Column("x", Integer, ForeignKey("a")))
+        assert b.c.x.references(a.c.x)
+
+        m2 = MetaData()
+        b2 = b.to_metadata(m2)
+        a2 = a.to_metadata(m2)
+        assert b2.c.x.references(a2.c.x)
+
+    def test_fk_w_no_colname_name_missing(self):
+        """test a ForeignKey that refers to table name only.  the column
+        name is assumed to be the same col name on parent table.
+
+        this is a little used feature from long ago that nonetheless is
+        still in the code.
+
+        """
+        m1 = MetaData()
+        a = Table("a", m1, Column("x", Integer))
+        b = Table("b", m1, Column("y", Integer, ForeignKey("a")))
+
+        with expect_raises_message(
+            exc.NoReferencedColumnError,
+            "Could not initialize target column for ForeignKey 'a' on "
+            "table 'b': table 'a' has no column named 'y'",
+        ):
+            assert b.c.y.references(a.c.x)
 
     def test_column_collection_constraint_w_ad_hoc_columns(self):
         """Test ColumnCollectionConstraint that has columns that aren't
@@ -1271,6 +1323,41 @@ class ToMetaDataTest(fixtures.TestBase, AssertsCompiledSQL, ComparesTables):
             return "h"
 
         self._assert_fk(t2, "z", "h.t1.x", referred_schema_fn=ref_fn)
+
+    def test_fk_reset_to_none(self):
+        m = MetaData()
+
+        t2 = Table("t2", m, Column("y", Integer, ForeignKey("p.t1.x")))
+
+        def ref_fn(table, to_schema, constraint, referred_schema):
+            return BLANK_SCHEMA
+
+        self._assert_fk(t2, None, "t1.x", referred_schema_fn=ref_fn)
+
+    @testing.combinations(None, RETAIN_SCHEMA)
+    def test_fk_test_non_return_for_referred_schema(self, sym):
+        m = MetaData()
+
+        t2 = Table("t2", m, Column("y", Integer, ForeignKey("p.t1.x")))
+
+        def ref_fn(table, to_schema, constraint, referred_schema):
+            return sym
+
+        self._assert_fk(t2, None, "p.t1.x", referred_schema_fn=ref_fn)
+
+    def test_fk_get_referent_is_always_a_column(self):
+        """test the annotation on ForeignKey.get_referent() in that it does
+        in fact return Column even if given a labeled expr in a subquery"""
+
+        m = MetaData()
+        a = Table("a", m, Column("id", Integer, primary_key=True))
+        b = Table("b", m, Column("aid", Integer, ForeignKey("a.id")))
+
+        stmt = select(a.c.id.label("somelabel")).subquery()
+
+        referent = list(b.c.aid.foreign_keys)[0].get_referent(stmt)
+        is_(referent, stmt.c.somelabel)
+        assert isinstance(referent, Column)
 
     def test_copy_info(self):
         m = MetaData()
@@ -2100,6 +2187,8 @@ class SchemaTypeTest(fixtures.TestBase):
     # causes collection-mutate-while-iterated errors in the event system
     # since the hooks here call upon the adapted type.  Need to figure out
     # why Enum and Boolean don't have this problem.
+    # NOTE: it's likely the need for the SchemaType.adapt() method,
+    # which Enum / Boolean don't use (and crash if it comes first)
     class MyType(TrackEvents, sqltypes.SchemaType, sqltypes.TypeEngine):
         pass
 
@@ -2141,7 +2230,7 @@ class SchemaTypeTest(fixtures.TestBase):
         # [ticket:3832]
         # this also serves as the test for [ticket:6152]
 
-        class MySchemaType(sqltypes.TypeEngine, sqltypes.SchemaType):
+        class MySchemaType(sqltypes.SchemaType):
             pass
 
         target_typ = MySchemaType()
@@ -3495,6 +3584,35 @@ class ConstraintTest(fixtures.TestBase):
         for c in t3.constraints:
             assert c.table is t3
 
+    def test_ColumnCollectionConstraint_copy(self):
+        m = MetaData()
+
+        t = Table("tbl", m, Column("a", Integer), Column("b", Integer))
+        t2 = Table("t2", m, Column("a", Integer), Column("b", Integer))
+
+        kw = {
+            "comment": "baz",
+            "name": "ccc",
+            "initially": "foo",
+            "deferrable": "bar",
+        }
+
+        UniqueConstraint(t.c.a, **kw)
+        CheckConstraint(t.c.a > 5, **kw)
+        ForeignKeyConstraint([t.c.a], [t2.c.a], **kw)
+        PrimaryKeyConstraint(t.c.a, **kw)
+
+        m2 = MetaData()
+
+        t3 = t.to_metadata(m2)
+
+        eq_(len(t3.constraints), 4)
+
+        for c in t3.constraints:
+            assert c.table is t3
+            for k, v in kw.items():
+                eq_(getattr(c, k), v)
+
     def test_check_constraint_copy(self):
         m = MetaData()
         t = Table("tbl", m, Column("a", Integer), Column("b", Integer))
@@ -4067,6 +4185,130 @@ class ColumnDefinitionTest(AssertsCompiledSQL, fixtures.TestBase):
         )
 
         deregister(schema.CreateColumn)
+
+    @testing.combinations(
+        ("default", lambda ctx: 10),
+        ("default", func.foo()),
+        ("identity_gen", Identity()),
+        ("identity_gen", Sequence("some_seq")),
+        ("identity_gen", Computed("side * side")),
+        ("onupdate", lambda ctx: 10),
+        ("onupdate", func.foo()),
+        ("server_onupdate", func.foo()),
+        ("server_default", func.foo()),
+        ("nullable", True),
+        ("nullable", False),
+        ("type", BigInteger()),
+        ("type", Enum("one", "two", "three", create_constraint=True)),
+        argnames="paramname, value",
+    )
+    def test_merge_column(
+        self,
+        paramname,
+        value,
+    ):
+
+        args = []
+        params = {}
+        if paramname == "type" or isinstance(
+            value, (Computed, Sequence, Identity)
+        ):
+            args.append(value)
+        else:
+            params[paramname] = value
+
+        source = Column(*args, **params)
+
+        target = Column()
+
+        source._merge(target)
+
+        if isinstance(value, (Computed, Identity)):
+            default = target.server_default
+            assert isinstance(default, type(value))
+        elif isinstance(value, Sequence):
+            default = target.default
+            assert isinstance(default, type(value))
+
+        elif paramname in (
+            "default",
+            "onupdate",
+            "server_default",
+            "server_onupdate",
+        ):
+            default = getattr(target, paramname)
+            is_(default.arg, value)
+            is_(default.column, target)
+        elif paramname == "type":
+            assert type(target.type) is type(value)
+
+            if isinstance(target.type, Enum):
+                target.name = "data"
+                t = Table("t", MetaData(), target)
+                assert CheckConstraint in [type(c) for c in t.constraints]
+        else:
+            is_(getattr(target, paramname), value)
+
+    @testing.combinations(
+        ("default", lambda ctx: 10, lambda ctx: 15),
+        ("default", func.foo(), func.bar()),
+        ("identity_gen", Identity(), Identity()),
+        ("identity_gen", Sequence("some_seq"), Sequence("some_other_seq")),
+        ("identity_gen", Computed("side * side"), Computed("top / top")),
+        ("onupdate", lambda ctx: 10, lambda ctx: 15),
+        ("onupdate", func.foo(), func.bar()),
+        ("server_onupdate", func.foo(), func.bar()),
+        ("server_default", func.foo(), func.bar()),
+        ("nullable", True, False),
+        ("nullable", False, True),
+        ("type", BigInteger(), Numeric()),
+        argnames="paramname, value, override_value",
+    )
+    def test_dont_merge_column(
+        self,
+        paramname,
+        value,
+        override_value,
+    ):
+
+        args = []
+        params = {}
+        override_args = []
+        override_params = {}
+        if paramname == "type" or isinstance(
+            value, (Computed, Sequence, Identity)
+        ):
+            args.append(value)
+            override_args.append(override_value)
+        else:
+            params[paramname] = value
+            override_params[paramname] = override_value
+
+        source = Column(*args, **params)
+
+        target = Column(*override_args, **override_params)
+
+        source._merge(target)
+
+        if isinstance(value, Sequence):
+            default = target.default
+            assert default is override_value
+        elif isinstance(value, (Computed, Identity)):
+            default = target.server_default
+            assert default is override_value
+        elif paramname in (
+            "default",
+            "onupdate",
+            "server_default",
+            "server_onupdate",
+        ):
+            default = getattr(target, paramname)
+            is_(default.arg, override_value)
+            is_(default.column, target)
+        elif paramname == "type":
+            assert type(target.type) is type(override_value)
+        else:
+            is_(getattr(target, paramname), override_value)
 
 
 class ColumnDefaultsTest(fixtures.TestBase):
@@ -5277,6 +5519,29 @@ class NamingConventionTest(fixtures.TestBase, AssertsCompiledSQL):
         )
         a1.append_constraint(fk)
         eq_(fk.name, "fk_address_user_id_user_id")
+
+    @testing.combinations(True, False, argnames="col_has_type")
+    def test_fk_ref_local_referent_has_no_type(self, col_has_type):
+        """test #7958"""
+
+        metadata = MetaData(
+            naming_convention={
+                "fk": "fk_%(referred_column_0_name)s",
+            }
+        )
+        Table("a", metadata, Column("id", Integer, primary_key=True))
+        b = Table(
+            "b",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("aid", ForeignKey("a.id"))
+            if not col_has_type
+            else Column("aid", Integer, ForeignKey("a.id")),
+        )
+        fks = list(
+            c for c in b.constraints if isinstance(c, ForeignKeyConstraint)
+        )
+        eq_(fks[0].name, "fk_id")
 
     def test_custom(self):
         def key_hash(const, table):

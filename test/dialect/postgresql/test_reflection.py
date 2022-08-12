@@ -21,23 +21,30 @@ from sqlalchemy import SmallInteger
 from sqlalchemy import String
 from sqlalchemy import Table
 from sqlalchemy import testing
+from sqlalchemy import Text
 from sqlalchemy import UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import base as postgresql
 from sqlalchemy.dialects.postgresql import ExcludeConstraint
 from sqlalchemy.dialects.postgresql import INTEGER
 from sqlalchemy.dialects.postgresql import INTERVAL
+from sqlalchemy.dialects.postgresql import pg_catalog
 from sqlalchemy.dialects.postgresql import TSRANGE
+from sqlalchemy.engine import ObjectKind
+from sqlalchemy.engine import ObjectScope
 from sqlalchemy.schema import CreateIndex
+from sqlalchemy.sql import ddl as sa_ddl
 from sqlalchemy.sql.schema import CheckConstraint
 from sqlalchemy.testing import AssertsCompiledSQL
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import mock
-from sqlalchemy.testing.assertions import assert_raises
 from sqlalchemy.testing.assertions import assert_warns
 from sqlalchemy.testing.assertions import AssertsExecutionResults
+from sqlalchemy.testing.assertions import ComparesIndexes
 from sqlalchemy.testing.assertions import eq_
+from sqlalchemy.testing.assertions import expect_raises
 from sqlalchemy.testing.assertions import is_
+from sqlalchemy.testing.assertions import is_false
 from sqlalchemy.testing.assertions import is_true
 
 
@@ -231,15 +238,34 @@ class MaterializedViewReflectionTest(
             connection.execute(target.insert(), {"id": 89, "data": "d1"})
 
         materialized_view = sa.DDL(
-            "CREATE MATERIALIZED VIEW test_mview AS " "SELECT * FROM testtable"
+            "CREATE MATERIALIZED VIEW test_mview AS SELECT * FROM testtable"
         )
 
         plain_view = sa.DDL(
-            "CREATE VIEW test_regview AS " "SELECT * FROM testtable"
+            "CREATE VIEW test_regview AS SELECT data FROM testtable"
         )
 
         sa.event.listen(testtable, "after_create", plain_view)
         sa.event.listen(testtable, "after_create", materialized_view)
+        sa.event.listen(
+            testtable,
+            "after_create",
+            sa.DDL("COMMENT ON VIEW test_regview IS 'regular view comment'"),
+        )
+        sa.event.listen(
+            testtable,
+            "after_create",
+            sa.DDL(
+                "COMMENT ON MATERIALIZED VIEW test_mview "
+                "IS 'materialized view comment'"
+            ),
+        )
+        sa.event.listen(
+            testtable,
+            "after_create",
+            sa.DDL("CREATE INDEX mat_index ON test_mview(data DESC)"),
+        )
+
         sa.event.listen(
             testtable,
             "before_drop",
@@ -248,6 +274,12 @@ class MaterializedViewReflectionTest(
         sa.event.listen(
             testtable, "before_drop", sa.DDL("DROP VIEW test_regview")
         )
+
+    def test_has_type(self, connection):
+        insp = inspect(connection)
+        is_true(insp.has_type("test_mview"))
+        is_true(insp.has_type("test_regview"))
+        is_true(insp.has_type("testtable"))
 
     def test_mview_is_reflected(self, connection):
         metadata = MetaData()
@@ -265,49 +297,99 @@ class MaterializedViewReflectionTest(
 
     def test_get_view_names(self, inspect_fixture):
         insp, conn = inspect_fixture
-        eq_(set(insp.get_view_names()), set(["test_regview", "test_mview"]))
+        eq_(set(insp.get_view_names()), set(["test_regview"]))
 
-    def test_get_view_names_plain(self, connection):
-        insp = inspect(connection)
-        eq_(
-            set(insp.get_view_names(include=("plain",))), set(["test_regview"])
-        )
-
-    def test_get_view_names_plain_string(self, connection):
-        insp = inspect(connection)
-        eq_(set(insp.get_view_names(include="plain")), set(["test_regview"]))
-
-    def test_get_view_names_materialized(self, connection):
-        insp = inspect(connection)
-        eq_(
-            set(insp.get_view_names(include=("materialized",))),
-            set(["test_mview"]),
-        )
+    def test_get_materialized_view_names(self, inspect_fixture):
+        insp, conn = inspect_fixture
+        eq_(set(insp.get_materialized_view_names()), set(["test_mview"]))
 
     def test_get_view_names_reflection_cache_ok(self, connection):
         insp = inspect(connection)
+        eq_(set(insp.get_view_names()), set(["test_regview"]))
         eq_(
-            set(insp.get_view_names(include=("plain",))), set(["test_regview"])
-        )
-        eq_(
-            set(insp.get_view_names(include=("materialized",))),
+            set(insp.get_materialized_view_names()),
             set(["test_mview"]),
         )
-        eq_(set(insp.get_view_names()), set(["test_regview", "test_mview"]))
-
-    def test_get_view_names_empty(self, connection):
-        insp = inspect(connection)
-        assert_raises(ValueError, insp.get_view_names, include=())
+        eq_(
+            set(insp.get_view_names()).union(
+                insp.get_materialized_view_names()
+            ),
+            set(["test_regview", "test_mview"]),
+        )
 
     def test_get_view_definition(self, connection):
         insp = inspect(connection)
+
+        def normalize(definition):
+            return re.sub(r"[\n\t ]+", " ", definition.strip())
+
         eq_(
-            re.sub(
-                r"[\n\t ]+",
-                " ",
-                insp.get_view_definition("test_mview").strip(),
-            ),
+            normalize(insp.get_view_definition("test_mview")),
             "SELECT testtable.id, testtable.data FROM testtable;",
+        )
+        eq_(
+            normalize(insp.get_view_definition("test_regview")),
+            "SELECT testtable.data FROM testtable;",
+        )
+
+    def test_get_view_comment(self, connection):
+        insp = inspect(connection)
+        eq_(
+            insp.get_table_comment("test_regview"),
+            {"text": "regular view comment"},
+        )
+        eq_(
+            insp.get_table_comment("test_mview"),
+            {"text": "materialized view comment"},
+        )
+
+    def test_get_multi_view_comment(self, connection):
+        insp = inspect(connection)
+        eq_(
+            insp.get_multi_table_comment(),
+            {(None, "testtable"): {"text": None}},
+        )
+        plain = {(None, "test_regview"): {"text": "regular view comment"}}
+        mat = {(None, "test_mview"): {"text": "materialized view comment"}}
+        eq_(insp.get_multi_table_comment(kind=ObjectKind.VIEW), plain)
+        eq_(
+            insp.get_multi_table_comment(kind=ObjectKind.MATERIALIZED_VIEW),
+            mat,
+        )
+        eq_(
+            insp.get_multi_table_comment(kind=ObjectKind.ANY_VIEW),
+            {**plain, **mat},
+        )
+        eq_(
+            insp.get_multi_table_comment(
+                kind=ObjectKind.ANY_VIEW, scope=ObjectScope.TEMPORARY
+            ),
+            {},
+        )
+
+    def test_get_multi_view_indexes(self, connection):
+        insp = inspect(connection)
+        eq_(insp.get_multi_indexes(), {(None, "testtable"): []})
+
+        exp = {
+            "name": "mat_index",
+            "unique": False,
+            "column_names": ["data"],
+            "column_sorting": {"data": ("desc",)},
+        }
+        if connection.dialect.server_version_info >= (11, 0):
+            exp["include_columns"] = []
+            exp["dialect_options"] = {"postgresql_include": []}
+        plain = {(None, "test_regview"): []}
+        mat = {(None, "test_mview"): [exp]}
+        eq_(insp.get_multi_indexes(kind=ObjectKind.VIEW), plain)
+        eq_(insp.get_multi_indexes(kind=ObjectKind.MATERIALIZED_VIEW), mat)
+        eq_(insp.get_multi_indexes(kind=ObjectKind.ANY_VIEW), {**plain, **mat})
+        eq_(
+            insp.get_multi_indexes(
+                kind=ObjectKind.ANY_VIEW, scope=ObjectScope.TEMPORARY
+            ),
+            {},
         )
 
 
@@ -331,6 +413,9 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
                 "CREATE DOMAIN nullable_domain AS TEXT CHECK "
                 "(VALUE IN('FOO', 'BAR'))",
                 "CREATE DOMAIN not_nullable_domain AS TEXT NOT NULL",
+                "CREATE DOMAIN my_int AS int CONSTRAINT b_my_int_one CHECK "
+                "(VALUE > 1) CONSTRAINT a_my_int_two CHECK (VALUE < 42) "
+                "CHECK(VALUE != 22)",
             ]:
                 try:
                     con.exec_driver_sql(ddl)
@@ -389,6 +474,7 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
             con.exec_driver_sql("DROP TABLE nullable_domain_test")
             con.exec_driver_sql("DROP DOMAIN nullable_domain")
             con.exec_driver_sql("DROP DOMAIN not_nullable_domain")
+            con.exec_driver_sql("DROP DOMAIN my_int")
 
     def test_table_is_reflected(self, connection):
         metadata = MetaData()
@@ -500,9 +586,125 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
         finally:
             base.PGDialect.ischema_names = ischema_names
 
+    @property
+    def all_domains(self):
+        return {
+            "public": [
+                {
+                    "visible": True,
+                    "name": "arraydomain",
+                    "schema": "public",
+                    "nullable": True,
+                    "type": "integer[]",
+                    "default": None,
+                    "constraints": [],
+                },
+                {
+                    "visible": True,
+                    "name": "enumdomain",
+                    "schema": "public",
+                    "nullable": True,
+                    "type": "testtype",
+                    "default": None,
+                    "constraints": [],
+                },
+                {
+                    "visible": True,
+                    "name": "my_int",
+                    "schema": "public",
+                    "nullable": True,
+                    "type": "integer",
+                    "default": None,
+                    "constraints": [
+                        {"check": "VALUE < 42", "name": "a_my_int_two"},
+                        {"check": "VALUE > 1", "name": "b_my_int_one"},
+                        # autogenerated name by pg
+                        {"check": "VALUE <> 22", "name": "my_int_check"},
+                    ],
+                },
+                {
+                    "visible": True,
+                    "name": "not_nullable_domain",
+                    "schema": "public",
+                    "nullable": False,
+                    "type": "text",
+                    "default": None,
+                    "constraints": [],
+                },
+                {
+                    "visible": True,
+                    "name": "nullable_domain",
+                    "schema": "public",
+                    "nullable": True,
+                    "type": "text",
+                    "default": None,
+                    "constraints": [
+                        {
+                            "check": "VALUE = ANY (ARRAY['FOO'::text, "
+                            "'BAR'::text])",
+                            # autogenerated name by pg
+                            "name": "nullable_domain_check",
+                        }
+                    ],
+                },
+                {
+                    "visible": True,
+                    "name": "testdomain",
+                    "schema": "public",
+                    "nullable": False,
+                    "type": "integer",
+                    "default": "42",
+                    "constraints": [],
+                },
+            ],
+            "test_schema": [
+                {
+                    "visible": False,
+                    "name": "testdomain",
+                    "schema": "test_schema",
+                    "nullable": True,
+                    "type": "integer",
+                    "default": "0",
+                    "constraints": [],
+                }
+            ],
+            "SomeSchema": [
+                {
+                    "visible": False,
+                    "name": "Quoted.Domain",
+                    "schema": "SomeSchema",
+                    "nullable": True,
+                    "type": "integer",
+                    "default": "0",
+                    "constraints": [],
+                }
+            ],
+        }
+
+    def test_inspect_domains(self, connection):
+        inspector = inspect(connection)
+        eq_(inspector.get_domains(), self.all_domains["public"])
+
+    def test_inspect_domains_schema(self, connection):
+        inspector = inspect(connection)
+        eq_(
+            inspector.get_domains("test_schema"),
+            self.all_domains["test_schema"],
+        )
+        eq_(
+            inspector.get_domains("SomeSchema"), self.all_domains["SomeSchema"]
+        )
+
+    def test_inspect_domains_star(self, connection):
+        inspector = inspect(connection)
+        all_ = [d for dl in self.all_domains.values() for d in dl]
+        all_ += inspector.get_domains("information_schema")
+        exp = sorted(all_, key=lambda d: (d["schema"], d["name"]))
+        eq_(inspector.get_domains("*"), exp)
+
 
 class ReflectionTest(
-    ReflectionFixtures, AssertsCompiledSQL, fixtures.TestBase
+    ReflectionFixtures, AssertsCompiledSQL, ComparesIndexes, fixtures.TestBase
 ):
     __only_on__ = "postgresql"
     __backend__ = True
@@ -952,7 +1154,7 @@ class ReflectionTest(
         A_seq.drop(connection)
 
     def test_index_reflection(self, metadata, connection):
-        """Reflecting expression-based indexes should warn"""
+        """Reflecting expression-based indexes works"""
 
         Table(
             "party",
@@ -960,44 +1162,99 @@ class ReflectionTest(
             Column("id", String(10), nullable=False),
             Column("name", String(20), index=True),
             Column("aname", String(20)),
+            Column("other", String(20)),
         )
         metadata.create_all(connection)
-        connection.exec_driver_sql("create index idx1 on party ((id || name))")
+        connection.exec_driver_sql(
+            """
+            create index idx3 on party
+                (lower(name::text), other, lower(aname::text))
+            """
+        )
+        connection.exec_driver_sql(
+            "create index idx1 on party ((id || name), (other || id::text))"
+        )
         connection.exec_driver_sql(
             "create unique index idx2 on party (id) where name = 'test'"
         )
         connection.exec_driver_sql(
             """
-            create index idx3 on party using btree
-                (lower(name::text), lower(aname::text))
+            create index idx4 on party using btree
+                (name nulls first, lower(other), aname desc)
+                where name != 'foo'
             """
         )
 
-        def go():
-            m2 = MetaData()
-            t2 = Table("party", m2, autoload_with=connection)
-            assert len(t2.indexes) == 2
+        expected = [
+            {
+                "name": "idx1",
+                "column_names": [None, None],
+                "expressions": [
+                    "(id::text || name::text)",
+                    "(other::text || id::text)",
+                ],
+                "unique": False,
+                "include_columns": [],
+                "dialect_options": {"postgresql_include": []},
+            },
+            {
+                "name": "idx2",
+                "column_names": ["id"],
+                "unique": True,
+                "include_columns": [],
+                "dialect_options": {
+                    "postgresql_include": [],
+                    "postgresql_where": "((name)::text = 'test'::text)",
+                },
+            },
+            {
+                "name": "idx3",
+                "column_names": [None, "other", None],
+                "expressions": [
+                    "lower(name::text)",
+                    "other",
+                    "lower(aname::text)",
+                ],
+                "unique": False,
+                "include_columns": [],
+                "dialect_options": {"postgresql_include": []},
+            },
+            {
+                "name": "idx4",
+                "column_names": ["name", None, "aname"],
+                "expressions": ["name", "lower(other::text)", "aname"],
+                "unique": False,
+                "include_columns": [],
+                "dialect_options": {
+                    "postgresql_include": [],
+                    "postgresql_where": "((name)::text <> 'foo'::text)",
+                },
+                "column_sorting": {
+                    "aname": ("desc",),
+                    "name": ("nulls_first",),
+                },
+            },
+            {
+                "name": "ix_party_name",
+                "column_names": ["name"],
+                "unique": False,
+                "include_columns": [],
+                "dialect_options": {"postgresql_include": []},
+            },
+        ]
+        if connection.dialect.server_version_info < (11,):
+            for index in expected:
+                index.pop("include_columns")
+                index["dialect_options"].pop("postgresql_include")
+                if not index["dialect_options"]:
+                    index.pop("dialect_options")
 
-            # Make sure indexes are in the order we expect them in
+        insp = inspect(connection)
+        eq_(insp.get_indexes("party"), expected)
 
-            tmp = [(idx.name, idx) for idx in t2.indexes]
-            tmp.sort()
-            r1, r2 = [idx[1] for idx in tmp]
-            assert r1.name == "idx2"
-            assert r1.unique is True
-            assert r2.unique is False
-            assert [t2.c.id] == r1.columns
-            assert [t2.c.name] == r2.columns
-
-        testing.assert_warnings(
-            go,
-            [
-                "Skipped unsupported reflection of "
-                "expression-based index idx1",
-                "Skipped unsupported reflection of "
-                "expression-based index idx3",
-            ],
-        )
+        m2 = MetaData()
+        t2 = Table("party", m2, autoload_with=connection)
+        self.compare_table_index_with_expected(t2, expected, "postgresql")
 
     def test_index_reflection_partial(self, metadata, connection):
         """Reflect the filter definition on partial indexes"""
@@ -1016,7 +1273,7 @@ class ReflectionTest(
 
         metadata.create_all(connection)
 
-        ind = connection.dialect.get_indexes(connection, t1, None)
+        ind = connection.dialect.get_indexes(connection, t1.name, None)
 
         partial_definitions = []
         for ix in ind:
@@ -1091,7 +1348,7 @@ class ReflectionTest(
 
         # "ASC NULLS LAST" is implicit default for indexes,
         # and "NULLS FIRST" is implicit default for "DESC".
-        # (https://www.postgresql.org/docs/11/indexes-ordering.html)
+        # (https://www.postgresql.org/docs/current/indexes-ordering.html)
 
         def compile_exprs(exprs):
             return list(map(str, exprs))
@@ -1219,13 +1476,24 @@ class ReflectionTest(
             Column("id", Integer, primary_key=True),
             Column("x", ARRAY(Integer)),
             Column("name", String(20)),
+            Column("aname", String(20)),
+            Column("other", Text()),
         )
         metadata.create_all(connection)
         connection.exec_driver_sql("CREATE INDEX idx1 ON t (x) INCLUDE (name)")
-
-        # prior to #5205, this would return:
-        # [{'column_names': ['x', 'name'],
-        #  'name': 'idx1', 'unique': False}]
+        connection.exec_driver_sql(
+            """
+            create index idx3 on t
+                (lower(name::text), other desc nulls last, lower(aname::text))
+                include (id, x)
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            create unique index idx2 on t using btree
+                (lower(other), (id * id)) include (id)
+            """
+        )
 
         ind = connection.dialect.get_indexes(connection, "t", None)
         eq_(
@@ -1237,7 +1505,30 @@ class ReflectionTest(
                     "include_columns": ["name"],
                     "dialect_options": {"postgresql_include": ["name"]},
                     "name": "idx1",
-                }
+                },
+                {
+                    "name": "idx2",
+                    "column_names": [None, None],
+                    "expressions": ["lower(other)", "(id * id)"],
+                    "unique": True,
+                    "include_columns": ["id"],
+                    "dialect_options": {"postgresql_include": ["id"]},
+                },
+                {
+                    "name": "idx3",
+                    "column_names": [None, "other", None],
+                    "expressions": [
+                        "lower(name::text)",
+                        "other",
+                        "lower(aname::text)",
+                    ],
+                    "unique": False,
+                    "include_columns": ["id", "x"],
+                    "dialect_options": {"postgresql_include": ["id", "x"]},
+                    "column_sorting": {
+                        "other": ("desc", "nulls_last"),
+                    },
+                },
             ],
         )
 
@@ -1297,6 +1588,7 @@ class ReflectionTest(
                     "initially": "DEFERRED",
                     "match": "FULL",
                 },
+                "comment": None,
             },
             "company_industry_id_fkey": {
                 "name": "company_industry_id_fkey",
@@ -1305,6 +1597,7 @@ class ReflectionTest(
                 "referred_table": "industry",
                 "referred_schema": None,
                 "options": {"onupdate": "CASCADE", "ondelete": "CASCADE"},
+                "comment": None,
             },
         }
         metadata.create_all(connection)
@@ -1337,6 +1630,9 @@ class ReflectionTest(
                 }
             ],
         )
+        is_true(inspector.has_type("mood", "test_schema"))
+        is_true(inspector.has_type("mood", "*"))
+        is_false(inspector.has_type("mood"))
 
     def test_inspect_enums(self, metadata, inspect_fixture):
 
@@ -1345,30 +1641,49 @@ class ReflectionTest(
         enum_type = postgresql.ENUM(
             "cat", "dog", "rat", name="pet", metadata=metadata
         )
+        enum_type.create(conn)
+        conn.commit()
 
-        with conn.begin():
-            enum_type.create(conn)
+        res = [
+            {
+                "visible": True,
+                "labels": ["cat", "dog", "rat"],
+                "name": "pet",
+                "schema": "public",
+            }
+        ]
+        eq_(inspector.get_enums(), res)
+        is_true(inspector.has_type("pet", "*"))
+        is_true(inspector.has_type("pet"))
+        is_false(inspector.has_type("pet", "test_schema"))
 
-        eq_(
-            inspector.get_enums(),
-            [
-                {
-                    "visible": True,
-                    "labels": ["cat", "dog", "rat"],
-                    "name": "pet",
-                    "schema": "public",
-                }
-            ],
-        )
+        enum_type.drop(conn)
+        conn.commit()
+        eq_(inspector.get_enums(), res)
+        is_true(inspector.has_type("pet"))
+        inspector.clear_cache()
+        eq_(inspector.get_enums(), [])
+        is_false(inspector.has_type("pet"))
 
-    def test_get_table_oid(self, metadata, inspect_fixture):
+    def test_get_table_oid(self, metadata, connection):
+        Table("t1", metadata, Column("col", Integer))
+        Table("t1", metadata, Column("col", Integer), schema="test_schema")
+        metadata.create_all(connection)
+        insp = inspect(connection)
+        oid = insp.get_table_oid("t1")
+        oid_schema = insp.get_table_oid("t1", schema="test_schema")
+        is_true(isinstance(oid, int))
+        is_true(isinstance(oid_schema, int))
+        is_true(oid != oid_schema)
 
-        inspector, conn = inspect_fixture
+        with expect_raises(exc.NoSuchTableError):
+            insp.get_table_oid("does_not_exist")
 
-        with conn.begin():
-            Table("some_table", metadata, Column("q", Integer)).create(conn)
-
-        assert inspector.get_table_oid("some_table") is not None
+        metadata.tables["t1"].drop(connection)
+        eq_(insp.get_table_oid("t1"), oid)
+        insp.clear_cache()
+        with expect_raises(exc.NoSuchTableError):
+            insp.get_table_oid("t1")
 
     def test_inspect_enums_case_sensitive(self, metadata, connection):
         sa.event.listen(
@@ -1699,85 +2014,239 @@ class ReflectionTest(
         eq_(
             check_constraints,
             {
-                "cc1": "(a > 1) AND (a < 5)",
-                "cc2": "(a = 1) OR ((a > 2) AND (a < 5))",
+                "cc1": "a > 1 AND a < 5",
+                "cc2": "a = 1 OR a > 2 AND a < 5",
                 "cc3": "is_positive(a)",
-                "cc4": "(b)::text <> 'hi\nim a name   \nyup\n'::text",
+                "cc4": "b::text <> 'hi\nim a name   \nyup\n'::text",
             },
         )
 
     def test_reflect_check_warning(self):
-        rows = [("some name", "NOTCHECK foobar")]
+        rows = [("foo", "some name", "NOTCHECK foobar", None)]
         conn = mock.Mock(
             execute=lambda *arg, **kw: mock.MagicMock(
                 fetchall=lambda: rows, __iter__=lambda self: iter(rows)
             )
         )
-        with mock.patch.object(
-            testing.db.dialect, "get_table_oid", lambda *arg, **kw: 1
+        with testing.expect_warnings(
+            "Could not parse CHECK constraint text: 'NOTCHECK foobar'"
         ):
-            with testing.expect_warnings(
-                "Could not parse CHECK constraint text: 'NOTCHECK foobar'"
-            ):
-                testing.db.dialect.get_check_constraints(conn, "foo")
+            testing.db.dialect.get_check_constraints(conn, "foo")
 
     def test_reflect_extra_newlines(self):
         rows = [
-            ("some name", "CHECK (\n(a \nIS\n NOT\n\n NULL\n)\n)"),
-            ("some other name", "CHECK ((b\nIS\nNOT\nNULL))"),
-            ("some CRLF name", "CHECK ((c\r\n\r\nIS\r\nNOT\r\nNULL))"),
-            ("some name", "CHECK (c != 'hi\nim a name\n')"),
+            (
+                "foo",
+                "some name",
+                "CHECK (\n(a \nIS\n NOT\n\n NULL\n)\n)",
+                None,
+            ),
+            ("foo", "some other name", "CHECK ((b\nIS\nNOT\nNULL))", None),
+            (
+                "foo",
+                "some CRLF name",
+                "CHECK ((c\r\n\r\nIS\r\nNOT\r\nNULL))",
+                None,
+            ),
+            ("foo", "some name", "CHECK (c != 'hi\nim a name\n')", None),
         ]
         conn = mock.Mock(
             execute=lambda *arg, **kw: mock.MagicMock(
                 fetchall=lambda: rows, __iter__=lambda self: iter(rows)
             )
         )
-        with mock.patch.object(
-            testing.db.dialect, "get_table_oid", lambda *arg, **kw: 1
-        ):
-            check_constraints = testing.db.dialect.get_check_constraints(
-                conn, "foo"
-            )
-            eq_(
-                check_constraints,
-                [
-                    {
-                        "name": "some name",
-                        "sqltext": "a \nIS\n NOT\n\n NULL\n",
-                    },
-                    {"name": "some other name", "sqltext": "b\nIS\nNOT\nNULL"},
-                    {
-                        "name": "some CRLF name",
-                        "sqltext": "c\r\n\r\nIS\r\nNOT\r\nNULL",
-                    },
-                    {"name": "some name", "sqltext": "c != 'hi\nim a name\n'"},
-                ],
-            )
+        check_constraints = testing.db.dialect.get_check_constraints(
+            conn, "foo"
+        )
+        eq_(
+            check_constraints,
+            [
+                {
+                    "name": "some name",
+                    "sqltext": "a \nIS\n NOT\n\n NULL\n",
+                    "comment": None,
+                },
+                {
+                    "name": "some other name",
+                    "sqltext": "b\nIS\nNOT\nNULL",
+                    "comment": None,
+                },
+                {
+                    "name": "some CRLF name",
+                    "sqltext": "c\r\n\r\nIS\r\nNOT\r\nNULL",
+                    "comment": None,
+                },
+                {
+                    "name": "some name",
+                    "sqltext": "c != 'hi\nim a name\n'",
+                    "comment": None,
+                },
+            ],
+        )
 
     def test_reflect_with_not_valid_check_constraint(self):
-        rows = [("some name", "CHECK ((a IS NOT NULL)) NOT VALID")]
+        rows = [
+            ("foo", "some name", "CHECK ((a IS NOT NULL)) NOT VALID", None)
+        ]
         conn = mock.Mock(
             execute=lambda *arg, **kw: mock.MagicMock(
                 fetchall=lambda: rows, __iter__=lambda self: iter(rows)
             )
         )
-        with mock.patch.object(
-            testing.db.dialect, "get_table_oid", lambda *arg, **kw: 1
-        ):
-            check_constraints = testing.db.dialect.get_check_constraints(
-                conn, "foo"
+        check_constraints = testing.db.dialect.get_check_constraints(
+            conn, "foo"
+        )
+        eq_(
+            check_constraints,
+            [
+                {
+                    "name": "some name",
+                    "sqltext": "a IS NOT NULL",
+                    "dialect_options": {"not_valid": True},
+                    "comment": None,
+                }
+            ],
+        )
+
+    def _apply_stm(self, connection, use_map):
+        if use_map:
+            return connection.execution_options(
+                schema_translate_map={
+                    None: "foo",
+                    testing.config.test_schema: "bar",
+                }
             )
-            eq_(
-                check_constraints,
-                [
-                    {
-                        "name": "some name",
-                        "sqltext": "a IS NOT NULL",
-                        "dialect_options": {"not_valid": True},
-                    }
-                ],
+        else:
+            return connection
+
+    @testing.combinations(True, False, argnames="use_map")
+    @testing.combinations(True, False, argnames="schema")
+    def test_schema_translate_map(self, metadata, connection, use_map, schema):
+        schema = testing.config.test_schema if schema else None
+        Table(
+            "foo",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("a", Integer, index=True),
+            Column(
+                "b",
+                ForeignKey(f"{schema}.foo.id" if schema else "foo.id"),
+                unique=True,
+            ),
+            CheckConstraint("a>10", name="foo_check"),
+            comment="comm",
+            schema=schema,
+        )
+        metadata.create_all(connection)
+        if use_map:
+            connection = connection.execution_options(
+                schema_translate_map={
+                    None: "foo",
+                    testing.config.test_schema: "bar",
+                }
             )
+        insp = inspect(connection)
+        eq_(
+            [c["name"] for c in insp.get_columns("foo", schema=schema)],
+            ["id", "a", "b"],
+        )
+        eq_(
+            [
+                i["column_names"]
+                for i in insp.get_indexes("foo", schema=schema)
+            ],
+            [["b"], ["a"]],
+        )
+        eq_(
+            insp.get_pk_constraint("foo", schema=schema)[
+                "constrained_columns"
+            ],
+            ["id"],
+        )
+        eq_(insp.get_table_comment("foo", schema=schema), {"text": "comm"})
+        eq_(
+            [
+                f["constrained_columns"]
+                for f in insp.get_foreign_keys("foo", schema=schema)
+            ],
+            [["b"]],
+        )
+        eq_(
+            [
+                c["name"]
+                for c in insp.get_check_constraints("foo", schema=schema)
+            ],
+            ["foo_check"],
+        )
+        eq_(
+            [
+                u["column_names"]
+                for u in insp.get_unique_constraints("foo", schema=schema)
+            ],
+            [["b"]],
+        )
+
+    def test_reflection_constraint_comments(self, connection, metadata):
+        t = Table(
+            "foo",
+            metadata,
+            Column("id", Integer),
+            Column("foo_id", ForeignKey("foo.id", name="fk_1")),
+            Column("foo_other_id", ForeignKey("foo.id", name="fk_2")),
+            CheckConstraint("id>0", name="ch_1"),
+            CheckConstraint("id<1000", name="ch_2"),
+            PrimaryKeyConstraint("id", name="foo_pk"),
+            UniqueConstraint("id", "foo_id", name="un_1"),
+            UniqueConstraint("id", "foo_other_id", name="un_2"),
+        )
+        metadata.create_all(connection)
+
+        def check(elements, exp):
+            elements = {c["name"]: c["comment"] for c in elements}
+            eq_(elements, exp)
+
+        def all_none():
+            insp = inspect(connection)
+            is_(insp.get_pk_constraint("foo")["comment"], None)
+            check(
+                insp.get_check_constraints("foo"), {"ch_1": None, "ch_2": None}
+            )
+            check(
+                insp.get_unique_constraints("foo"),
+                {"un_1": None, "un_2": None},
+            )
+            check(insp.get_foreign_keys("foo"), {"fk_1": None, "fk_2": None})
+
+        all_none()
+
+        c = next(c for c in t.constraints if c.name == "ch_1")
+        u = next(c for c in t.constraints if c.name == "un_1")
+        f = next(c for c in t.foreign_key_constraints if c.name == "fk_1")
+        p = t.primary_key
+        c.comment = "cc comment"
+        u.comment = "uc comment"
+        f.comment = "fc comment"
+        p.comment = "pk comment"
+        for cst in [c, u, f, p]:
+            connection.execute(sa_ddl.SetConstraintComment(cst))
+
+        insp = inspect(connection)
+        eq_(insp.get_pk_constraint("foo")["comment"], "pk comment")
+        check(
+            insp.get_check_constraints("foo"),
+            {"ch_1": "cc comment", "ch_2": None},
+        )
+        check(
+            insp.get_unique_constraints("foo"),
+            {"un_1": "uc comment", "un_2": None},
+        )
+        check(
+            insp.get_foreign_keys("foo"), {"fk_1": "fc comment", "fk_2": None}
+        )
+
+        for cst in [c, u, f, p]:
+            connection.execute(sa_ddl.DropConstraintComment(cst))
+        all_none()
 
 
 class CustomTypeReflectionTest(fixtures.TestBase):
@@ -1804,9 +2273,23 @@ class CustomTypeReflectionTest(fixtures.TestBase):
             ("my_custom_type(ARG1)", ("ARG1", None)),
             ("my_custom_type(ARG1, ARG2)", ("ARG1", "ARG2")),
         ]:
-            column_info = dialect._get_column_info(
-                "colname", sch, None, False, {}, {}, "public", None, "", None
+            row_dict = {
+                "name": "colname",
+                "table_name": "tblname",
+                "format_type": sch,
+                "default": None,
+                "not_null": False,
+                "comment": None,
+                "generated": "",
+                "identity_options": None,
+            }
+            column_info = dialect._get_columns_info(
+                [row_dict], {}, {}, "public"
             )
+            assert ("public", "tblname") in column_info
+            column_info = column_info[("public", "tblname")]
+            assert len(column_info) == 1
+            column_info = column_info[0]
             assert isinstance(column_info["type"], self.CustomType)
             eq_(column_info["type"].arg1, args[0])
             eq_(column_info["type"].arg2, args[1])
@@ -1939,15 +2422,76 @@ class IdentityReflectionTest(fixtures.TablesTest):
             elif col["name"] == "id2":
                 is_true("identity" in col)
                 exp = default.copy()
-                exp.update(maxvalue=2 ** 31 - 1)
+                exp.update(maxvalue=2**31 - 1)
                 eq_(col["identity"], exp)
             elif col["name"] == "id3":
                 is_true("identity" in col)
                 exp = default.copy()
-                exp.update(maxvalue=2 ** 63 - 1)
+                exp.update(maxvalue=2**63 - 1)
                 eq_(col["identity"], exp)
             elif col["name"] == "id4":
                 is_true("identity" in col)
                 exp = default.copy()
-                exp.update(maxvalue=2 ** 15 - 1)
+                exp.update(maxvalue=2**15 - 1)
                 eq_(col["identity"], exp)
+
+
+class TestReflectDifficultColTypes(fixtures.TablesTest):
+    __only_on__ = "postgresql"
+    __backend__ = True
+
+    def define_tables(metadata):
+        Table(
+            "sample_table",
+            metadata,
+            Column("c1", Integer, primary_key=True),
+            Column("c2", Integer, unique=True),
+            Column("c3", Integer),
+            Index("sample_table_index", "c2", "c3"),
+        )
+
+    def check_int_list(self, row, key):
+        value = row[key]
+        is_true(isinstance(value, list))
+        is_true(len(value) > 0)
+        is_true(all(isinstance(v, int) for v in value))
+
+    def test_pg_index(self, connection):
+        insp = inspect(connection)
+
+        pgc_oid = insp.get_table_oid("sample_table")
+        cols = [
+            col
+            for col in pg_catalog.pg_index.c
+            if testing.db.dialect.server_version_info
+            >= col.info.get("server_version", (0,))
+        ]
+
+        stmt = sa.select(*cols).filter_by(indrelid=pgc_oid)
+        rows = connection.execute(stmt).mappings().all()
+        is_true(len(rows) > 0)
+        cols = [
+            col
+            for col in ["indkey", "indoption", "indclass", "indcollation"]
+            if testing.db.dialect.server_version_info
+            >= pg_catalog.pg_index.c[col].info.get("server_version", (0,))
+        ]
+        for row in rows:
+            for col in cols:
+                self.check_int_list(row, col)
+
+    def test_pg_constraint(self, connection):
+        insp = inspect(connection)
+
+        pgc_oid = insp.get_table_oid("sample_table")
+        cols = [
+            col
+            for col in pg_catalog.pg_constraint.c
+            if testing.db.dialect.server_version_info
+            >= col.info.get("server_version", (0,))
+        ]
+        stmt = sa.select(*cols).filter_by(conrelid=pgc_oid)
+        rows = connection.execute(stmt).mappings().all()
+        is_true(len(rows) > 0)
+        for row in rows:
+            self.check_int_list(row, "conkey")

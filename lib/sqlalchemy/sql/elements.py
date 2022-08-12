@@ -4,6 +4,7 @@
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: allow-untyped-defs, allow-untyped-calls
 
 """Core SQL expression elements, including :class:`_expression.ClauseElement`,
 :class:`_expression.ColumnElement`, and derived classes.
@@ -18,6 +19,7 @@ import itertools
 import operator
 import re
 import typing
+from typing import AbstractSet
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -25,6 +27,7 @@ from typing import Dict
 from typing import FrozenSet
 from typing import Generic
 from typing import Iterable
+from typing import Iterator
 from typing import List
 from typing import Mapping
 from typing import Optional
@@ -52,6 +55,7 @@ from .base import _clone
 from .base import _generative
 from .base import _NoArg
 from .base import Executable
+from .base import Generative
 from .base import HasMemoized
 from .base import Immutable
 from .base import NO_ARG
@@ -69,29 +73,33 @@ from .visitors import Visitable
 from .. import exc
 from .. import inspection
 from .. import util
-from ..util.langhelpers import TypingOnly
+from ..util import HasMemoized_ro_memoized_attribute
+from ..util import TypingOnly
 from ..util.typing import Literal
 
 if typing.TYPE_CHECKING:
-    from ._typing import _ColumnExpression
+    from ._typing import _ColumnExpressionArgument
+    from ._typing import _InfoType
     from ._typing import _PropagateAttrsType
     from ._typing import _TypeEngineArgument
+    from .cache_key import _CacheKeyTraversalType
     from .cache_key import CacheKey
     from .compiler import Compiled
     from .compiler import SQLCompiler
     from .functions import FunctionElement
     from .operators import OperatorType
+    from .schema import _ServerDefaultType
     from .schema import Column
     from .schema import DefaultGenerator
+    from .schema import FetchedValue
     from .schema import ForeignKey
+    from .selectable import _SelectIterable
     from .selectable import FromClause
     from .selectable import NamedFromClause
-    from .selectable import ReturnsRows
     from .selectable import Select
-    from .selectable import TableClause
-    from .sqltypes import Boolean
     from .sqltypes import TupleType
     from .type_api import TypeEngine
+    from .visitors import _CloneCallableType
     from .visitors import _TraverseInternalsType
     from ..engine import Connection
     from ..engine import Dialect
@@ -103,8 +111,8 @@ if typing.TYPE_CHECKING:
     from ..engine.interfaces import CacheStats
     from ..engine.result import Result
 
-_NUMERIC = Union[complex, Decimal]
-_NUMBER = Union[complex, int, Decimal]
+_NUMERIC = Union[float, Decimal]
+_NUMBER = Union[float, int, Decimal]
 
 _T = TypeVar("_T", bound="Any")
 _OPT = TypeVar("_OPT", bound="Any")
@@ -113,7 +121,11 @@ _NT = TypeVar("_NT", bound="_NUMERIC")
 _NMT = TypeVar("_NMT", bound="_NUMBER")
 
 
-def literal(value, type_=None):
+def literal(
+    value: Any,
+    type_: Optional[_TypeEngineArgument[_T]] = None,
+    literal_execute: bool = False,
+) -> BindParameter[_T]:
     r"""Return a literal clause, bound to a bind parameter.
 
     Literal clauses are created automatically when non-
@@ -126,16 +138,29 @@ def literal(value, type_=None):
     :class:`BindParameter` with a bound value.
 
     :param value: the value to be bound. Can be any Python object supported by
-        the underlying DB-API, or is translatable via the given type argument.
+     the underlying DB-API, or is translatable via the given type argument.
 
-    :param type\_: an optional :class:`~sqlalchemy.types.TypeEngine` which
-        will provide bind-parameter translation for this literal.
+    :param type\_: an optional :class:`~sqlalchemy.types.TypeEngine` which will
+     provide bind-parameter translation for this literal.
+
+    :param literal_execute: optional bool, when True, the SQL engine will
+     attempt to render the bound value directly in the SQL statement at
+     execution time rather than providing as a parameter value.
+
+     .. versionadded:: 2.0
 
     """
-    return coercions.expect(roles.LiteralValueRole, value, type_=type_)
+    return coercions.expect(
+        roles.LiteralValueRole,
+        value,
+        type_=type_,
+        literal_execute=literal_execute,
+    )
 
 
-def literal_column(text, type_=None):
+def literal_column(
+    text: str, type_: Optional[_TypeEngineArgument[_T]] = None
+) -> ColumnClause[_T]:
     r"""Produce a :class:`.ColumnClause` object that has the
     :paramref:`_expression.column.is_literal` flag set to True.
 
@@ -165,7 +190,7 @@ def literal_column(text, type_=None):
 
         :func:`_expression.text`
 
-        :ref:`sqlexpression_literal_column`
+        :ref:`tutorial_select_arbitrary_text`
 
     """
     return ColumnClause(text, type_=type_, is_literal=True)
@@ -258,6 +283,8 @@ class CompilerElement(Visitable):
         """Return a compiler appropriate for this ClauseElement, given a
         Dialect."""
 
+        if TYPE_CHECKING:
+            assert isinstance(self, ClauseElement)
         return dialect.statement_compiler(dialect, self, **kw)
 
     def __str__(self) -> str:
@@ -282,13 +309,20 @@ class ClauseElement(
 
     __visit_name__ = "clause"
 
-    _propagate_attrs: _PropagateAttrsType = util.immutabledict()
-    """like annotations, however these propagate outwards liberally
-    as SQL constructs are built, and are set up at construction time.
+    if TYPE_CHECKING:
 
-    """
+        @util.memoized_property
+        def _propagate_attrs(self) -> _PropagateAttrsType:
+            """like annotations, however these propagate outwards liberally
+            as SQL constructs are built, and are set up at construction time.
 
-    @util.memoized_property
+            """
+            ...
+
+    else:
+        _propagate_attrs = util.EMPTY_DICT
+
+    @util.ro_memoized_property
     def description(self) -> Optional[str]:
         return None
 
@@ -296,7 +330,9 @@ class ClauseElement(
 
     is_clause_element = True
     is_selectable = False
-
+    is_dml = False
+    _is_column_element = False
+    _is_keyed_column_element = False
     _is_table = False
     _is_textual = False
     _is_from_clause = False
@@ -304,33 +340,37 @@ class ClauseElement(
     _is_text_clause = False
     _is_from_container = False
     _is_select_container = False
+    _is_select_base = False
     _is_select_statement = False
     _is_bind_parameter = False
     _is_clause_list = False
     _is_lambda_element = False
     _is_singleton_constant = False
     _is_immutable = False
+    _is_star = False
 
     @property
     def _order_by_label_element(self) -> Optional[Label[Any]]:
         return None
 
-    _cache_key_traversal = None
+    _cache_key_traversal: _CacheKeyTraversalType = None
 
-    negation_clause: ClauseElement
+    negation_clause: ColumnElement[bool]
 
     if typing.TYPE_CHECKING:
 
         def get_children(
-            self, omit_attrs: typing_Tuple[str, ...] = ..., **kw: Any
+            self, *, omit_attrs: typing_Tuple[str, ...] = ..., **kw: Any
         ) -> Iterable[ClauseElement]:
             ...
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return []
 
-    def _set_propagate_attrs(self, values):
+    def _set_propagate_attrs(
+        self: SelfClauseElement, values: Mapping[str, Any]
+    ) -> SelfClauseElement:
         # usually, self._propagate_attrs is empty here.  one case where it's
         # not is a subquery against ORM select, that is then pulled as a
         # property of an aliased class.   should all be good
@@ -348,17 +388,25 @@ class ClauseElement(
         the _copy_internals() method.
 
         """
+
         skip = self._memoized_keys
         c = self.__class__.__new__(self.__class__)
-        c.__dict__ = {k: v for k, v in self.__dict__.items() if k not in skip}
+
+        if skip:
+            # ensure this iteration remains atomic
+            c.__dict__ = {
+                k: v for k, v in self.__dict__.copy().items() if k not in skip
+            }
+        else:
+            c.__dict__ = self.__dict__.copy()
 
         # this is a marker that helps to "equate" clauses to each other
         # when a Select returns its list of FROM clauses.  the cloning
         # process leaves around a lot of remnants of the previous clause
         # typically in the form of column expressions still attached to the
         # old table.
-        c._is_clone_of = self
-
+        cc = self._is_clone_of
+        c._is_clone_of = cc if cc is not None else self
         return c
 
     def _negate_in_binary(self, negated_op, original_op):
@@ -432,9 +480,8 @@ class ClauseElement(
         connection: Connection,
         distilled_params: _CoreMultiExecuteParams,
         execution_options: _ExecuteOptions,
-        _force: bool = False,
-    ) -> Result:
-        if _force or self.supports_execution:
+    ) -> Result[Any]:
+        if self.supports_execution:
             if TYPE_CHECKING:
                 assert isinstance(self, Executable)
             return connection._execute_clauseelement(
@@ -442,6 +489,22 @@ class ClauseElement(
             )
         else:
             raise exc.ObjectNotExecutableError(self)
+
+    def _execute_on_scalar(
+        self,
+        connection: Connection,
+        distilled_params: _CoreMultiExecuteParams,
+        execution_options: _ExecuteOptions,
+    ) -> Any:
+        """an additional hook for subclasses to provide a different
+        implementation for connection.scalar() vs. connection.execute().
+
+        .. versionadded:: 2.0
+
+        """
+        return self._execute_on_connection(
+            connection, distilled_params, execution_options
+        ).scalar()
 
     def unique_params(
         self: SelfClauseElement,
@@ -461,7 +524,7 @@ class ClauseElement(
 
     def params(
         self: SelfClauseElement,
-        __optionaldict: Optional[Dict[str, Any]] = None,
+        __optionaldict: Optional[Mapping[str, Any]] = None,
         **kwargs: Any,
     ) -> SelfClauseElement:
         """Return a copy with :func:`_expression.bindparam` elements
@@ -483,7 +546,7 @@ class ClauseElement(
     def _replace_params(
         self: SelfClauseElement,
         unique: bool,
-        optionaldict: Optional[Dict[str, Any]],
+        optionaldict: Optional[Mapping[str, Any]],
         kwargs: Dict[str, Any],
     ) -> SelfClauseElement:
 
@@ -497,16 +560,13 @@ class ClauseElement(
             if unique:
                 bind._convert_to_unique()
 
-        return cast(
-            SelfClauseElement,
-            cloned_traverse(
-                self,
-                {"maintain_key": True, "detect_subquery_cols": True},
-                {"bindparam": visit_bindparam},
-            ),
+        return cloned_traverse(
+            self,
+            {"maintain_key": True, "detect_subquery_cols": True},
+            {"bindparam": visit_bindparam},
         )
 
-    def compare(self, other, **kw):
+    def compare(self, other: ClauseElement, **kw: Any) -> bool:
         r"""Compare this :class:`_expression.ClauseElement` to
         the given :class:`_expression.ClauseElement`.
 
@@ -520,7 +580,7 @@ class ClauseElement(
         """
         return traversals.compare(self, other, **kw)
 
-    def self_group(self, against=None):
+    def self_group(self, against: Optional[OperatorType] = None) -> Any:
         """Apply a 'grouping' to this :class:`_expression.ClauseElement`.
 
         This method is overridden by subclasses to return a "grouping"
@@ -629,14 +689,12 @@ class ClauseElement(
             return self._negate()
 
     def _negate(self) -> ClauseElement:
-        return UnaryExpression(
-            self.self_group(against=operators.inv), operator=operators.inv
-        )
+        grouped = self.self_group(against=operators.inv)
+        assert isinstance(grouped, ColumnElement)
+        return UnaryExpression(grouped, operator=operators.inv)
 
     def __bool__(self):
         raise TypeError("Boolean value of this clause is not defined")
-
-    __nonzero__ = __bool__
 
     def __repr__(self):
         friendly = self.description
@@ -661,15 +719,17 @@ class DQLDMLClauseElement(ClauseElement):
 
     if typing.TYPE_CHECKING:
 
+        def _compiler(self, dialect: Dialect, **kw: Any) -> SQLCompiler:
+            """Return a compiler appropriate for this ClauseElement, given a
+            Dialect."""
+            ...
+
         def compile(  # noqa: A001
             self,
             bind: Optional[Union[Engine, Connection]] = None,
             dialect: Optional[Dialect] = None,
             **kw: Any,
         ) -> SQLCompiler:
-            ...
-
-        def _compiler(self, dialect: Dialect, **kw: Any) -> SQLCompiler:
             ...
 
 
@@ -688,6 +748,9 @@ class CompilerColumnElement(
     __slots__ = ()
 
 
+# SQLCoreOperations should be suiting the ExpressionElementRole
+# and ColumnsClauseRole.   however the MRO issues become too elaborate
+# at the moment.
 class SQLCoreOperations(Generic[_T], ColumnOperators, TypingOnly):
     __slots__ = ()
 
@@ -696,7 +759,9 @@ class SQLCoreOperations(Generic[_T], ColumnOperators, TypingOnly):
     # redefined with the specific types returned by ColumnElement hierarchies
     if typing.TYPE_CHECKING:
 
-        _propagate_attrs: _PropagateAttrsType
+        @util.non_memoized_property
+        def _propagate_attrs(self) -> _PropagateAttrsType:
+            ...
 
         def operate(
             self, op: OperatorType, *other: Any, **kwargs: Any
@@ -791,13 +856,13 @@ class SQLCoreOperations(Generic[_T], ColumnOperators, TypingOnly):
 
         def in_(
             self,
-            other: Union[Sequence[Any], BindParameter[Any], Select],
+            other: Union[Sequence[Any], BindParameter[Any], Select[Any]],
         ) -> BinaryExpression[bool]:
             ...
 
         def not_in(
             self,
-            other: Union[Sequence[Any], BindParameter[Any], Select],
+            other: Union[Sequence[Any], BindParameter[Any], Select[Any]],
         ) -> BinaryExpression[bool]:
             ...
 
@@ -995,8 +1060,12 @@ class SQLCoreOperations(Generic[_T], ColumnOperators, TypingOnly):
 
         @overload
         def __truediv__(
-            self: _SQO[_NMT], other: Any
+            self: _SQO[int], other: Any
         ) -> ColumnElement[_NUMERIC]:
+            ...
+
+        @overload
+        def __truediv__(self: _SQO[_NT], other: Any) -> ColumnElement[_NT]:
             ...
 
         @overload
@@ -1142,10 +1211,9 @@ class ColumnElement(
 
     primary_key: bool = False
     _is_clone_of: Optional[ColumnElement[_T]]
+    _is_column_element = True
 
-    @util.memoized_property
-    def foreign_keys(self) -> Iterable[ForeignKey]:
-        return []
+    foreign_keys: AbstractSet[ForeignKey] = frozenset()
 
     @util.memoized_property
     def _proxies(self) -> List[ColumnElement[Any]]:
@@ -1268,14 +1336,14 @@ class ColumnElement(
 
     @overload
     def self_group(
-        self: ColumnElement[bool], against: Optional[OperatorType] = None
-    ) -> ColumnElement[bool]:
+        self: ColumnElement[_T], against: Optional[OperatorType] = None
+    ) -> ColumnElement[_T]:
         ...
 
     @overload
     def self_group(
-        self: ColumnElement[_T], against: Optional[OperatorType] = None
-    ) -> ColumnElement[_T]:
+        self: ColumnElement[Any], against: Optional[OperatorType] = None
+    ) -> ColumnElement[Any]:
         ...
 
     def self_group(
@@ -1303,7 +1371,11 @@ class ColumnElement(
         if self.type._type_affinity is type_api.BOOLEANTYPE._type_affinity:
             return AsBoolean(self, operators.is_false, operators.is_true)
         else:
-            return cast("UnaryExpression[_T]", super()._negate())
+            grouped = self.self_group(against=operators.inv)
+            assert isinstance(grouped, ColumnElement)
+            return UnaryExpression(
+                grouped, operator=operators.inv, wraps_column_expression=True
+            )
 
     type: TypeEngine[_T]
 
@@ -1380,7 +1452,7 @@ class ColumnElement(
         return self
 
     @property
-    def _select_iterable(self) -> Iterable[ColumnElement[Any]]:
+    def _select_iterable(self) -> _SelectIterable:
         return (self,)
 
     @util.memoized_property
@@ -1461,6 +1533,7 @@ class ColumnElement(
     def _make_proxy(
         self,
         selectable: FromClause,
+        *,
         name: Optional[str] = None,
         key: Optional[str] = None,
         name_is_truncatable: bool = False,
@@ -1478,6 +1551,8 @@ class ColumnElement(
         else:
             key = name
 
+        assert key is not None
+
         co: ColumnClause[_T] = ColumnClause(
             coercions.expect(roles.TruncatedLabelRole, name)
             if name_is_truncatable
@@ -1490,7 +1565,6 @@ class ColumnElement(
         co._proxies = [self]
         if selectable._is_clone_of is not None:
             co._is_clone_of = selectable._is_clone_of.columns.get(key)
-        assert key is not None
         return key, co
 
     def cast(self, type_: TypeEngine[_T]) -> Cast[_T]:
@@ -1500,7 +1574,7 @@ class ColumnElement(
 
         .. seealso::
 
-            :ref:`coretutorial_casts`
+            :ref:`tutorial_casts`
 
             :func:`_expression.cast`
 
@@ -1648,6 +1722,14 @@ class ColumnElement(
         return self._anon_label(label, add_hash=idx)
 
 
+class KeyedColumnElement(ColumnElement[_T]):
+    """ColumnElement where ``.key`` is non-None."""
+
+    _is_keyed_column_element = True
+
+    key: str
+
+
 class WrapsColumnExpression(ColumnElement[_T]):
     """Mixin that defines a :class:`_expression.ColumnElement`
     as a wrapper with special
@@ -1705,11 +1787,19 @@ class WrapsColumnExpression(ColumnElement[_T]):
         else:
             return self._dedupe_anon_tq_label_idx(idx)
 
+    @property
+    def _proxy_key(self):
+        wce = self.wrapped_column_expression
+
+        if not wce._is_text_clause:
+            return wce._proxy_key
+        return super()._proxy_key
+
 
 SelfBindParameter = TypeVar("SelfBindParameter", bound="BindParameter[Any]")
 
 
-class BindParameter(roles.InElementRole, ColumnElement[_T]):
+class BindParameter(roles.InElementRole, KeyedColumnElement[_T]):
     r"""Represent a "bound expression".
 
     :class:`.BindParameter` is invoked explicitly using the
@@ -1736,10 +1826,12 @@ class BindParameter(roles.InElementRole, ColumnElement[_T]):
         ("type", InternalTraversal.dp_type),
         ("callable", InternalTraversal.dp_plain_dict),
         ("value", InternalTraversal.dp_plain_obj),
+        ("literal_execute", InternalTraversal.dp_boolean),
     ]
 
     key: str
     type: TypeEngine[_T]
+    value: Optional[_T]
 
     _is_crud = False
     _is_bind_parameter = True
@@ -1771,7 +1863,7 @@ class BindParameter(roles.InElementRole, ColumnElement[_T]):
             value = None
 
         if quote is not None:
-            key = quoted_name(key, quote)
+            key = quoted_name.construct(key, quote)
 
         if unique:
             self.key = _anonymous_label.safe_construct(
@@ -1859,7 +1951,7 @@ class BindParameter(roles.InElementRole, ColumnElement[_T]):
         return cloned
 
     @property
-    def effective_value(self):
+    def effective_value(self) -> Optional[_T]:
         """Return the value of this bound parameter,
         taking into account if the ``callable`` parameter
         was set.
@@ -1869,11 +1961,12 @@ class BindParameter(roles.InElementRole, ColumnElement[_T]):
 
         """
         if self.callable:
-            return self.callable()
+            # TODO: set up protocol for bind parameter callable
+            return self.callable()  # type: ignore
         else:
             return self.value
 
-    def render_literal_execute(self):
+    def render_literal_execute(self) -> BindParameter[_T]:
         """Produce a copy of this bound parameter that will enable the
         :paramref:`_sql.BindParameter.literal_execute` flag.
 
@@ -1918,6 +2011,15 @@ class BindParameter(roles.InElementRole, ColumnElement[_T]):
         self: SelfBindParameter, maintain_key: bool = False, **kw: Any
     ) -> SelfBindParameter:
         c = ClauseElement._clone(self, **kw)
+        # ensure all the BindParameter objects stay in cloned set.
+        # in #7823, we changed "clone" so that a clone only keeps a reference
+        # to the "original" element, since for column correspondence, that's
+        # all we need.   However, for BindParam, _cloned_set is used by
+        # the "cache key bind match" lookup, which means if any of those
+        # interim BindParameter objects became part of a cache key in the
+        # cache, we need it.  So here, make sure all clones keep carrying
+        # forward.
+        c._cloned_set.update(self._cloned_set)
         if not maintain_key and self.unique:
             c.key = _anonymous_label.safe_construct(
                 id(c), c._orig_key or "param", sanitize_key=True
@@ -1944,6 +2046,7 @@ class BindParameter(roles.InElementRole, ColumnElement[_T]):
             self.__class__,
             self.type._static_cache_key,
             self.key % anon_map if self._key_is_anon else self.key,
+            self.literal_execute,
         )
 
     def _convert_to_unique(self):
@@ -2008,10 +2111,12 @@ class TextClause(
     roles.OrderByRole,
     roles.FromClauseRole,
     roles.SelectStatementRole,
-    roles.BinaryElementRole[Any],
     roles.InElementRole,
+    Generative,
     Executable,
     DQLDMLClauseElement,
+    roles.BinaryElementRole[Any],
+    inspection.Inspectable["TextClause"],
 ):
     """Represent a literal SQL text fragment.
 
@@ -2058,7 +2163,7 @@ class TextClause(
         return and_(self, other)
 
     @property
-    def _select_iterable(self):
+    def _select_iterable(self) -> _SelectIterable:
         return (self,)
 
     # help in those cases where text() is
@@ -2067,6 +2172,10 @@ class TextClause(
     _label: Optional[str] = None
 
     _allow_label_resolve = False
+
+    @property
+    def _is_star(self):
+        return self.text == "*"
 
     def __init__(self, text: str):
         self._bindparams: Dict[str, BindParameter[Any]] = {}
@@ -2438,7 +2547,9 @@ class True_(SingletonConstant, roles.ConstExprRole[bool], ColumnElement[bool]):
         return False_._singleton
 
     @classmethod
-    def _ifnone(cls, other):
+    def _ifnone(
+        cls, other: Optional[ColumnElement[Any]]
+    ) -> ColumnElement[Any]:
         if other is None:
             return cls._instance()
         else:
@@ -2467,6 +2578,8 @@ class ClauseList(
 
     __visit_name__ = "clauselist"
 
+    # this is used only by the ORM in a legacy use case for
+    # composite attributes
     _is_clause_list = True
 
     _traverse_internals: _TraverseInternalsType = [
@@ -2474,57 +2587,61 @@ class ClauseList(
         ("operator", InternalTraversal.dp_operator),
     ]
 
+    clauses: List[ColumnElement[Any]]
+
     def __init__(
         self,
-        *clauses: _ColumnExpression[Any],
+        *clauses: _ColumnExpressionArgument[Any],
         operator: OperatorType = operators.comma_op,
         group: bool = True,
         group_contents: bool = True,
-        _flatten_sub_clauses: bool = False,
         _literal_as_text_role: Type[roles.SQLRole] = roles.WhereHavingRole,
     ):
         self.operator = operator
         self.group = group
         self.group_contents = group_contents
-        if _flatten_sub_clauses:
-            clauses = util.flatten_iterator(clauses)
-        self._text_converter_role: Type[roles.SQLRole] = _literal_as_text_role
+        clauses_iterator: Iterable[_ColumnExpressionArgument[Any]] = clauses
         text_converter_role: Type[roles.SQLRole] = _literal_as_text_role
+        self._text_converter_role = text_converter_role
 
         if self.group_contents:
             self.clauses = [
                 coercions.expect(
                     text_converter_role, clause, apply_propagate_attrs=self
                 ).self_group(against=self.operator)
-                for clause in clauses
+                for clause in clauses_iterator
             ]
         else:
             self.clauses = [
                 coercions.expect(
                     text_converter_role, clause, apply_propagate_attrs=self
                 )
-                for clause in clauses
+                for clause in clauses_iterator
             ]
         self._is_implicitly_boolean = operators.is_boolean(self.operator)
 
     @classmethod
-    def _construct_raw(cls, operator, clauses=None):
+    def _construct_raw(
+        cls,
+        operator: OperatorType,
+        clauses: Optional[Sequence[ColumnElement[Any]]] = None,
+    ) -> ClauseList:
         self = cls.__new__(cls)
-        self.clauses = clauses if clauses else []
+        self.clauses = list(clauses) if clauses else []
         self.group = True
         self.operator = operator
         self.group_contents = True
         self._is_implicitly_boolean = False
         return self
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[ColumnElement[Any]]:
         return iter(self.clauses)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.clauses)
 
     @property
-    def _select_iterable(self):
+    def _select_iterable(self) -> _SelectIterable:
         return itertools.chain.from_iterable(
             [elem._select_iterable for elem in self.clauses]
         )
@@ -2541,7 +2658,7 @@ class ClauseList(
                 coercions.expect(self._text_converter_role, clause)
             )
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return list(itertools.chain(*[c._from_objects for c in self.clauses]))
 
@@ -2552,8 +2669,176 @@ class ClauseList(
             return self
 
 
-class BooleanClauseList(ClauseList, ColumnElement[bool]):
-    __visit_name__ = "clauselist"
+class OperatorExpression(ColumnElement[_T]):
+    """base for expressions that contain an operator and operands
+
+    .. versionadded:: 2.0
+
+    """
+
+    operator: OperatorType
+    type: TypeEngine[_T]
+
+    group: bool = True
+
+    @property
+    def is_comparison(self):
+        return operators.is_comparison(self.operator)
+
+    def self_group(self, against=None):
+        if (
+            self.group
+            and operators.is_precedent(self.operator, against)
+            or (
+                # a negate against a non-boolean operator
+                # doesn't make too much sense but we should
+                # group for that
+                against is operators.inv
+                and not operators.is_boolean(self.operator)
+            )
+        ):
+            return Grouping(self)
+        else:
+            return self
+
+    @property
+    def _flattened_operator_clauses(
+        self,
+    ) -> typing_Tuple[ColumnElement[Any], ...]:
+        raise NotImplementedError()
+
+    @classmethod
+    def _construct_for_op(
+        cls,
+        left: ColumnElement[Any],
+        right: ColumnElement[Any],
+        op: OperatorType,
+        *,
+        type_: TypeEngine[_T],
+        negate: Optional[OperatorType] = None,
+        modifiers: Optional[Mapping[str, Any]] = None,
+    ) -> OperatorExpression[_T]:
+
+        if operators.is_associative(op):
+            assert (
+                negate is None
+            ), f"negate not supported for associative operator {op}"
+
+            multi = False
+            if getattr(
+                left, "operator", None
+            ) is op and type_._compare_type_affinity(left.type):
+                multi = True
+                left_flattened = left._flattened_operator_clauses
+            else:
+                left_flattened = (left,)
+
+            if getattr(
+                right, "operator", None
+            ) is op and type_._compare_type_affinity(right.type):
+                multi = True
+                right_flattened = right._flattened_operator_clauses
+            else:
+                right_flattened = (right,)
+
+            if multi:
+                return ExpressionClauseList._construct_for_list(
+                    op, type_, *(left_flattened + right_flattened)
+                )
+
+        return BinaryExpression(
+            left, right, op, type_=type_, negate=negate, modifiers=modifiers
+        )
+
+
+class ExpressionClauseList(OperatorExpression[_T]):
+    """Describe a list of clauses, separated by an operator,
+    in a column expression context.
+
+    :class:`.ExpressionClauseList` differs from :class:`.ClauseList` in that
+    it represents a column-oriented DQL expression only, not an open ended
+    list of anything comma separated.
+
+    .. versionadded:: 2.0
+
+    """
+
+    __visit_name__ = "expression_clauselist"
+
+    _traverse_internals: _TraverseInternalsType = [
+        ("clauses", InternalTraversal.dp_clauseelement_tuple),
+        ("operator", InternalTraversal.dp_operator),
+    ]
+
+    clauses: typing_Tuple[ColumnElement[Any], ...]
+
+    group: bool
+
+    def __init__(
+        self,
+        operator: OperatorType,
+        *clauses: _ColumnExpressionArgument[Any],
+        type_: Optional[_TypeEngineArgument[_T]] = None,
+    ):
+        self.operator = operator
+
+        self.clauses = tuple(
+            coercions.expect(
+                roles.ExpressionElementRole, clause, apply_propagate_attrs=self
+            )
+            for clause in clauses
+        )
+        self._is_implicitly_boolean = operators.is_boolean(self.operator)
+        self.type = type_api.to_instance(type_)  # type: ignore
+
+    @property
+    def _flattened_operator_clauses(
+        self,
+    ) -> typing_Tuple[ColumnElement[Any], ...]:
+        return self.clauses
+
+    def __iter__(self) -> Iterator[ColumnElement[Any]]:
+        return iter(self.clauses)
+
+    def __len__(self) -> int:
+        return len(self.clauses)
+
+    @property
+    def _select_iterable(self) -> _SelectIterable:
+        return (self,)
+
+    @util.ro_non_memoized_property
+    def _from_objects(self) -> List[FromClause]:
+        return list(itertools.chain(*[c._from_objects for c in self.clauses]))
+
+    def _append_inplace(self, clause: ColumnElement[Any]) -> None:
+        self.clauses += (clause,)
+
+    @classmethod
+    def _construct_for_list(
+        cls,
+        operator: OperatorType,
+        type_: TypeEngine[_T],
+        *clauses: ColumnElement[Any],
+        group: bool = True,
+    ) -> ExpressionClauseList[_T]:
+        self = cls.__new__(cls)
+        self.group = group
+        self.clauses = clauses
+        self.operator = operator
+        self.type = type_
+        return self
+
+    def _negate(self) -> Any:
+        grouped = self.self_group(against=operators.inv)
+        assert isinstance(grouped, ColumnElement)
+        return UnaryExpression(
+            grouped, operator=operators.inv, wraps_column_expression=True
+        )
+
+
+class BooleanClauseList(ExpressionClauseList[bool]):
+    __visit_name__ = "expression_clauselist"
     inherit_cache = True
 
     def __init__(self, *arg, **kw):
@@ -2563,8 +2848,12 @@ class BooleanClauseList(ClauseList, ColumnElement[bool]):
 
     @classmethod
     def _process_clauses_for_boolean(
-        cls, operator, continue_on, skip_on, clauses
-    ):
+        cls,
+        operator: OperatorType,
+        continue_on: Any,
+        skip_on: Any,
+        clauses: Iterable[ColumnElement[Any]],
+    ) -> typing_Tuple[int, List[ColumnElement[Any]]]:
         has_continue_on = None
 
         convert_clauses = []
@@ -2606,9 +2895,9 @@ class BooleanClauseList(ClauseList, ColumnElement[bool]):
         operator: OperatorType,
         continue_on: Any,
         skip_on: Any,
-        *clauses: _ColumnExpression[Any],
+        *clauses: _ColumnExpressionArgument[Any],
         **kw: Any,
-    ) -> BooleanClauseList:
+    ) -> ColumnElement[Any]:
         lcc, convert_clauses = cls._process_clauses_for_boolean(
             operator,
             continue_on,
@@ -2622,11 +2911,19 @@ class BooleanClauseList(ClauseList, ColumnElement[bool]):
         if lcc > 1:
             # multiple elements.  Return regular BooleanClauseList
             # which will link elements against the operator.
-            return cls._construct_raw(operator, convert_clauses)  # type: ignore[no-any-return] # noqa E501
+
+            flattened_clauses = itertools.chain.from_iterable(
+                (c for c in to_flat._flattened_operator_clauses)
+                if getattr(to_flat, "operator", None) is operator
+                else (to_flat,)
+                for to_flat in convert_clauses
+            )
+
+            return cls._construct_raw(operator, flattened_clauses)  # type: ignore # noqa: E501
         elif lcc == 1:
             # just one element.  return it as a single boolean element,
             # not a list and discard the operator.
-            return convert_clauses[0]  # type: ignore[no-any-return] # noqa E501
+            return convert_clauses[0]  # type: ignore[no-any-return] # noqa: E501
         else:
             # no elements period.  deprecated use case.  return an empty
             # ClauseList construct that generates nothing unless it has
@@ -2643,10 +2940,12 @@ class BooleanClauseList(ClauseList, ColumnElement[bool]):
                 },
                 version="1.4",
             )
-            return cls._construct_raw(operator)  # type: ignore[no-any-return] # noqa E501
+            return cls._construct_raw(operator)  # type: ignore[no-any-return] # noqa: E501
 
     @classmethod
-    def _construct_for_whereclause(cls, clauses):
+    def _construct_for_whereclause(
+        cls, clauses: Iterable[ColumnElement[Any]]
+    ) -> Optional[ColumnElement[bool]]:
         operator, continue_on, skip_on = (
             operators.and_,
             True_._singleton,
@@ -2672,18 +2971,23 @@ class BooleanClauseList(ClauseList, ColumnElement[bool]):
             return None
 
     @classmethod
-    def _construct_raw(cls, operator, clauses=None):
+    def _construct_raw(
+        cls,
+        operator: OperatorType,
+        clauses: Optional[Sequence[ColumnElement[Any]]] = None,
+    ) -> BooleanClauseList:
         self = cls.__new__(cls)
-        self.clauses = clauses if clauses else []
+        self.clauses = tuple(clauses) if clauses else ()
         self.group = True
         self.operator = operator
-        self.group_contents = True
         self.type = type_api.BOOLEANTYPE
         self._is_implicitly_boolean = True
         return self
 
     @classmethod
-    def and_(cls, *clauses: _ColumnExpression[bool]) -> BooleanClauseList:
+    def and_(
+        cls, *clauses: _ColumnExpressionArgument[bool]
+    ) -> ColumnElement[bool]:
         r"""Produce a conjunction of expressions joined by ``AND``.
 
         See :func:`_sql.and_` for full documentation.
@@ -2693,7 +2997,9 @@ class BooleanClauseList(ClauseList, ColumnElement[bool]):
         )
 
     @classmethod
-    def or_(cls, *clauses: _ColumnExpression[bool]) -> BooleanClauseList:
+    def or_(
+        cls, *clauses: _ColumnExpressionArgument[bool]
+    ) -> ColumnElement[bool]:
         """Produce a conjunction of expressions joined by ``OR``.
 
         See :func:`_sql.or_` for full documentation.
@@ -2703,7 +3009,7 @@ class BooleanClauseList(ClauseList, ColumnElement[bool]):
         )
 
     @property
-    def _select_iterable(self):
+    def _select_iterable(self) -> _SelectIterable:
         return (self,)
 
     def self_group(self, against=None):
@@ -2711,9 +3017,6 @@ class BooleanClauseList(ClauseList, ColumnElement[bool]):
             return self
         else:
             return super(BooleanClauseList, self).self_group(against=against)
-
-    def _negate(self):
-        return ClauseList._negate(self)
 
 
 and_ = BooleanClauseList.and_
@@ -2734,13 +3037,13 @@ class Tuple(ClauseList, ColumnElement[typing_Tuple[Any, ...]]):
     @util.preload_module("sqlalchemy.sql.sqltypes")
     def __init__(
         self,
-        *clauses: _ColumnExpression[Any],
+        *clauses: _ColumnExpressionArgument[Any],
         types: Optional[Sequence[_TypeEngineArgument[Any]]] = None,
     ):
         sqltypes = util.preloaded.sql_sqltypes
 
         if types is None:
-            init_clauses = [
+            init_clauses: List[ColumnElement[Any]] = [
                 coercions.expect(roles.ExpressionElementRole, c)
                 for c in clauses
             ]
@@ -2763,7 +3066,7 @@ class Tuple(ClauseList, ColumnElement[typing_Tuple[Any, ...]]):
         super(Tuple, self).__init__(*init_clauses)
 
     @property
-    def _select_iterable(self):
+    def _select_iterable(self) -> _SelectIterable:
         return (self,)
 
     def _bind_param(self, operator, obj, type_=None, expanding=False):
@@ -2839,7 +3142,8 @@ class Case(ColumnElement[_T]):
     def __init__(
         self,
         *whens: Union[
-            typing_Tuple[_ColumnExpression[bool], Any], Mapping[Any, Any]
+            typing_Tuple[_ColumnExpressionArgument[bool], Any],
+            Mapping[Any, Any],
         ],
         value: Optional[Any] = None,
         else_: Optional[Any] = None,
@@ -2866,7 +3170,7 @@ class Case(ColumnElement[_T]):
         ]
 
         if whenlist:
-            type_ = list(whenlist[-1])[-1].type
+            type_ = whenlist[-1][-1].type
         else:
             type_ = None
 
@@ -2883,7 +3187,7 @@ class Case(ColumnElement[_T]):
         else:
             self.else_ = None
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return list(
             itertools.chain(*[x._from_objects for x in self.get_children()])
@@ -2904,7 +3208,7 @@ class Cast(WrapsColumnExpression[_T]):
 
     .. seealso::
 
-        :ref:`coretutorial_casts`
+        :ref:`tutorial_casts`
 
         :func:`.cast`
 
@@ -2927,7 +3231,7 @@ class Cast(WrapsColumnExpression[_T]):
 
     def __init__(
         self,
-        expression: _ColumnExpression[Any],
+        expression: _ColumnExpressionArgument[Any],
         type_: _TypeEngineArgument[_T],
     ):
         self.type = type_api.to_instance(type_)
@@ -2939,7 +3243,7 @@ class Cast(WrapsColumnExpression[_T]):
         )
         self.typeclause = TypeClause(self.type)
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return self.clause._from_objects
 
@@ -2978,7 +3282,7 @@ class TypeCoerce(WrapsColumnExpression[_T]):
 
     def __init__(
         self,
-        expression: _ColumnExpression[Any],
+        expression: _ColumnExpressionArgument[Any],
         type_: _TypeEngineArgument[_T],
     ):
         self.type = type_api.to_instance(type_)
@@ -2989,7 +3293,7 @@ class TypeCoerce(WrapsColumnExpression[_T]):
             apply_propagate_attrs=self,
         )
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return self.clause._from_objects
 
@@ -3027,12 +3331,12 @@ class Extract(ColumnElement[int]):
     expr: ColumnElement[Any]
     field: str
 
-    def __init__(self, field: str, expr: _ColumnExpression[Any]):
+    def __init__(self, field: str, expr: _ColumnExpressionArgument[Any]):
         self.type = type_api.INTEGERTYPE
         self.field = field
         self.expr = coercions.expect(roles.ExpressionElementRole, expr)
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return self.expr._from_objects
 
@@ -3056,10 +3360,12 @@ class _label_reference(ColumnElement[_T]):
         ("element", InternalTraversal.dp_clauseelement)
     ]
 
+    element: ColumnElement[_T]
+
     def __init__(self, element: ColumnElement[_T]):
         self.element = element
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return []
 
@@ -3115,13 +3421,17 @@ class UnaryExpression(ColumnElement[_T]):
         self.element = element.self_group(
             against=self.operator or self.modifier
         )
-        self.type: TypeEngine[_T] = type_api.to_instance(type_)
+
+        # if type is None, we get NULLTYPE, which is our _T.  But I don't
+        # know how to get the overloads to express that correctly
+        self.type = type_api.to_instance(type_)  # type: ignore
+
         self.wraps_column_expression = wraps_column_expression
 
     @classmethod
     def _create_nulls_first(
         cls,
-        column: _ColumnExpression[_T],
+        column: _ColumnExpressionArgument[_T],
     ) -> UnaryExpression[_T]:
         return UnaryExpression(
             coercions.expect(roles.ByOfRole, column),
@@ -3132,7 +3442,7 @@ class UnaryExpression(ColumnElement[_T]):
     @classmethod
     def _create_nulls_last(
         cls,
-        column: _ColumnExpression[_T],
+        column: _ColumnExpressionArgument[_T],
     ) -> UnaryExpression[_T]:
         return UnaryExpression(
             coercions.expect(roles.ByOfRole, column),
@@ -3142,7 +3452,7 @@ class UnaryExpression(ColumnElement[_T]):
 
     @classmethod
     def _create_desc(
-        cls, column: _ColumnExpression[_T]
+        cls, column: _ColumnExpressionArgument[_T]
     ) -> UnaryExpression[_T]:
         return UnaryExpression(
             coercions.expect(roles.ByOfRole, column),
@@ -3153,7 +3463,7 @@ class UnaryExpression(ColumnElement[_T]):
     @classmethod
     def _create_asc(
         cls,
-        column: _ColumnExpression[_T],
+        column: _ColumnExpressionArgument[_T],
     ) -> UnaryExpression[_T]:
         return UnaryExpression(
             coercions.expect(roles.ByOfRole, column),
@@ -3164,9 +3474,11 @@ class UnaryExpression(ColumnElement[_T]):
     @classmethod
     def _create_distinct(
         cls,
-        expr: _ColumnExpression[_T],
+        expr: _ColumnExpressionArgument[_T],
     ) -> UnaryExpression[_T]:
-        col_expr = coercions.expect(roles.ExpressionElementRole, expr)
+        col_expr: ColumnElement[_T] = coercions.expect(
+            roles.ExpressionElementRole, expr
+        )
         return UnaryExpression(
             col_expr,
             operator=operators.distinct_op,
@@ -3181,7 +3493,7 @@ class UnaryExpression(ColumnElement[_T]):
         else:
             return None
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return self.element._from_objects
 
@@ -3217,28 +3529,33 @@ class CollectionAggregate(UnaryExpression[_T]):
 
     @classmethod
     def _create_any(
-        cls, expr: _ColumnExpression[_T]
-    ) -> CollectionAggregate[_T]:
-        expr = coercions.expect(roles.ExpressionElementRole, expr)
-
-        expr = expr.self_group()
-        return CollectionAggregate(
+        cls, expr: _ColumnExpressionArgument[_T]
+    ) -> CollectionAggregate[bool]:
+        col_expr: ColumnElement[_T] = coercions.expect(
+            roles.ExpressionElementRole,
             expr,
+        )
+        col_expr = col_expr.self_group()
+        return CollectionAggregate(
+            col_expr,
             operator=operators.any_op,
-            type_=type_api.NULLTYPE,
+            type_=type_api.BOOLEANTYPE,
             wraps_column_expression=False,
         )
 
     @classmethod
     def _create_all(
-        cls, expr: _ColumnExpression[_T]
-    ) -> CollectionAggregate[_T]:
-        expr = coercions.expect(roles.ExpressionElementRole, expr)
-        expr = expr.self_group()
-        return CollectionAggregate(
+        cls, expr: _ColumnExpressionArgument[_T]
+    ) -> CollectionAggregate[bool]:
+        col_expr: ColumnElement[_T] = coercions.expect(
+            roles.ExpressionElementRole,
             expr,
+        )
+        col_expr = col_expr.self_group()
+        return CollectionAggregate(
+            col_expr,
             operator=operators.all_op,
-            type_=type_api.NULLTYPE,
+            type_=type_api.BOOLEANTYPE,
             wraps_column_expression=False,
         )
 
@@ -3287,7 +3604,7 @@ class AsBoolean(WrapsColumnExpression[bool], UnaryExpression[bool]):
             return AsBoolean(self.element, self.negate, self.operator)
 
 
-class BinaryExpression(ColumnElement[_T]):
+class BinaryExpression(OperatorExpression[_T]):
     """Represent an expression that is ``LEFT <operator> RIGHT``.
 
     A :class:`.BinaryExpression` is generated automatically
@@ -3323,10 +3640,13 @@ class BinaryExpression(ColumnElement[_T]):
 
     modifiers: Optional[Mapping[str, Any]]
 
+    left: ColumnElement[Any]
+    right: ColumnElement[Any]
+
     def __init__(
         self,
         left: ColumnElement[Any],
-        right: Union[ColumnElement[Any], ClauseList],
+        right: ColumnElement[Any],
         operator: OperatorType,
         type_: Optional[_TypeEngineArgument[_T]] = None,
         negate: Optional[OperatorType] = None,
@@ -3341,7 +3661,11 @@ class BinaryExpression(ColumnElement[_T]):
         self.left = left.self_group(against=operator)
         self.right = right.self_group(against=operator)
         self.operator = operator
-        self.type: TypeEngine[_T] = type_api.to_instance(type_)
+
+        # if type is None, we get NULLTYPE, which is our _T.  But I don't
+        # know how to get the overloads to express that correctly
+        self.type = type_api.to_instance(type_)  # type: ignore
+
         self.negate = negate
         self._is_implicitly_boolean = operators.is_boolean(operator)
 
@@ -3349,6 +3673,12 @@ class BinaryExpression(ColumnElement[_T]):
             self.modifiers = {}
         else:
             self.modifiers = modifiers
+
+    @property
+    def _flattened_operator_clauses(
+        self,
+    ) -> typing_Tuple[ColumnElement[Any], ...]:
+        return (self.left, self.right)
 
     def __bool__(self):
         """Implement Python-side "bool" for BinaryExpression as a
@@ -3388,8 +3718,6 @@ class BinaryExpression(ColumnElement[_T]):
         else:
             raise TypeError("Boolean value of this clause is not defined")
 
-    __nonzero__ = __bool__
-
     if typing.TYPE_CHECKING:
 
         def __invert__(
@@ -3397,20 +3725,9 @@ class BinaryExpression(ColumnElement[_T]):
         ) -> "BinaryExpression[_T]":
             ...
 
-    @property
-    def is_comparison(self):
-        return operators.is_comparison(self.operator)
-
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return self.left._from_objects + self.right._from_objects
-
-    def self_group(self, against=None):
-
-        if operators.is_precedent(self.operator, against):
-            return Grouping(self)
-        else:
-            return self
 
     def _negate(self):
         if self.negate is not None:
@@ -3503,7 +3820,9 @@ class Grouping(GroupedElement, ColumnElement[_T]):
         self, element: Union[TextClause, ClauseList, ColumnElement[_T]]
     ):
         self.element = element
-        self.type = getattr(element, "type", type_api.NULLTYPE)
+
+        # nulltype assignment issue
+        self.type = getattr(element, "type", type_api.NULLTYPE)  # type: ignore
 
     def _with_binary_element_type(self, type_):
         return self.__class__(self.element._with_binary_element_type(type_))
@@ -3525,7 +3844,7 @@ class Grouping(GroupedElement, ColumnElement[_T]):
         else:
             return []
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return self.element._from_objects
 
@@ -3582,10 +3901,16 @@ class Over(ColumnElement[_T]):
         self,
         element: ColumnElement[_T],
         partition_by: Optional[
-            Union[Iterable[_ColumnExpression[Any]], _ColumnExpression[Any]]
+            Union[
+                Iterable[_ColumnExpressionArgument[Any]],
+                _ColumnExpressionArgument[Any],
+            ]
         ] = None,
         order_by: Optional[
-            Union[Iterable[_ColumnExpression[Any]], _ColumnExpression[Any]]
+            Union[
+                Iterable[_ColumnExpressionArgument[Any]],
+                _ColumnExpressionArgument[Any],
+            ]
         ] = None,
         range_: Optional[typing_Tuple[Optional[int], Optional[int]]] = None,
         rows: Optional[typing_Tuple[Optional[int], Optional[int]]] = None,
@@ -3665,7 +3990,7 @@ class Over(ColumnElement[_T]):
     def type(self):
         return self.element.type
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return list(
             itertools.chain(
@@ -3705,7 +4030,9 @@ class WithinGroup(ColumnElement[_T]):
     order_by: Optional[ClauseList] = None
 
     def __init__(
-        self, element: FunctionElement[_T], *order_by: _ColumnExpression[Any]
+        self,
+        element: FunctionElement[_T],
+        *order_by: _ColumnExpressionArgument[Any],
     ):
         self.element = element
         if order_by is not None:
@@ -3742,7 +4069,7 @@ class WithinGroup(ColumnElement[_T]):
         else:
             return self.element.type
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return list(
             itertools.chain(
@@ -3785,7 +4112,9 @@ class FunctionFilter(ColumnElement[_T]):
     criterion: Optional[ColumnElement[bool]] = None
 
     def __init__(
-        self, func: FunctionElement[_T], *criterion: _ColumnExpression[bool]
+        self,
+        func: FunctionElement[_T],
+        *criterion: _ColumnExpressionArgument[bool],
     ):
         self.func = func
         self.filter(*criterion)
@@ -3815,10 +4144,16 @@ class FunctionFilter(ColumnElement[_T]):
     def over(
         self,
         partition_by: Optional[
-            Union[Iterable[_ColumnExpression[Any]], _ColumnExpression[Any]]
+            Union[
+                Iterable[_ColumnExpressionArgument[Any]],
+                _ColumnExpressionArgument[Any],
+            ]
         ] = None,
         order_by: Optional[
-            Union[Iterable[_ColumnExpression[Any]], _ColumnExpression[Any]]
+            Union[
+                Iterable[_ColumnExpressionArgument[Any]],
+                _ColumnExpressionArgument[Any],
+            ]
         ] = None,
         range_: Optional[typing_Tuple[Optional[int], Optional[int]]] = None,
         rows: Optional[typing_Tuple[Optional[int], Optional[int]]] = None,
@@ -3858,7 +4193,7 @@ class FunctionFilter(ColumnElement[_T]):
     def type(self):
         return self.func.type
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return list(
             itertools.chain(
@@ -3871,158 +4206,18 @@ class FunctionFilter(ColumnElement[_T]):
         )
 
 
-class Label(roles.LabeledColumnExprRole[_T], ColumnElement[_T]):
-    """Represents a column label (AS).
-
-    Represent a label, as typically applied to any column-level
-    element using the ``AS`` sql keyword.
-
-    """
-
-    __visit_name__ = "label"
-
-    _traverse_internals: _TraverseInternalsType = [
-        ("name", InternalTraversal.dp_anon_name),
-        ("type", InternalTraversal.dp_type),
-        ("_element", InternalTraversal.dp_clauseelement),
-    ]
-
-    _element: ColumnElement[_T]
-    name: str
-
-    def __init__(
-        self,
-        name: Optional[str],
-        element: _ColumnExpression[_T],
-        type_: Optional[_TypeEngineArgument[_T]] = None,
-    ):
-        orig_element = element
-        element = coercions.expect(
-            roles.ExpressionElementRole,
-            element,
-            apply_propagate_attrs=self,
-        )
-        while isinstance(element, Label):
-            # TODO: this is only covered in test_text.py, but nothing
-            # fails if it's removed.  determine rationale
-            element = element.element
-
-        if name:
-            self.name = name
-        else:
-            self.name = _anonymous_label.safe_construct(
-                id(self), getattr(element, "name", "anon")
-            )
-            if isinstance(orig_element, Label):
-                # TODO: no coverage for this block, again would be in
-                # test_text.py where the resolve_label concept is important
-                self._resolve_label = orig_element._label
-
-        self.key = self._tq_label = self._tq_key_label = self.name
-        self._element = element
-        # self._type = type_
-        self.type = type_api.to_instance(
-            type_ or getattr(self._element, "type", None)
-        )
-        self._proxies = [element]
-
-    def __reduce__(self):
-        return self.__class__, (self.name, self._element, self.type)
-
-    @util.memoized_property
-    def _is_implicitly_boolean(self):
-        return self.element._is_implicitly_boolean
-
-    @HasMemoized.memoized_attribute
-    def _allow_label_resolve(self):
-        return self.element._allow_label_resolve
-
-    @property
-    def _order_by_label_element(self):
-        return self
-
-    @HasMemoized.memoized_attribute
-    def element(self) -> ColumnElement[_T]:
-        return self._element.self_group(against=operators.as_)
-
-    def self_group(self, against=None):
-        return self._apply_to_inner(self._element.self_group, against=against)
-
-    def _negate(self):
-        return self._apply_to_inner(self._element._negate)
-
-    def _apply_to_inner(self, fn, *arg, **kw):
-        sub_element = fn(*arg, **kw)
-        if sub_element is not self._element:
-            return Label(self.name, sub_element, type_=self.type)
-        else:
-            return self
-
-    @property
-    def primary_key(self):
-        return self.element.primary_key
-
-    @property
-    def foreign_keys(self):
-        return self.element.foreign_keys
-
-    def _copy_internals(self, clone=_clone, anonymize_labels=False, **kw):
-        self._reset_memoizations()
-        self._element = clone(self._element, **kw)
-        if anonymize_labels:
-            self.name = _anonymous_label.safe_construct(
-                id(self), getattr(self.element, "name", "anon")
-            )
-            self.key = self._tq_label = self._tq_key_label = self.name
-
-    @util.non_memoized_property
-    def _from_objects(self) -> List[FromClause]:
-        return self.element._from_objects
-
-    def _make_proxy(self, selectable, name=None, **kw):
-        name = self.name if not name else name
-
-        key, e = self.element._make_proxy(
-            selectable,
-            name=name,
-            disallow_is_literal=True,
-            name_is_truncatable=isinstance(name, _truncated_label),
-        )
-
-        # there was a note here to remove this assertion, which was here
-        # to determine if we later could support a use case where
-        # the key and name of a label are separate.  But I don't know what
-        # that case was.  For now, this is an unexpected case that occurs
-        # when a label name conflicts with other columns and select()
-        # is attempting to disambiguate an explicit label, which is not what
-        # the user would want.   See issue #6090.
-        if key != self.name:
-            raise exc.InvalidRequestError(
-                "Label name %s is being renamed to an anonymous label due "
-                "to disambiguation "
-                "which is not supported right now.  Please use unique names "
-                "for explicit labels." % (self.name)
-            )
-
-        e._propagate_attrs = selectable._propagate_attrs
-        e._proxies.append(self)
-        if self.type is not None:
-            e.type = self.type
-
-        return self.key, e
-
-
-class NamedColumn(ColumnElement[_T]):
+class NamedColumn(KeyedColumnElement[_T]):
     is_literal = False
     table: Optional[FromClause] = None
     name: str
+    key: str
 
     def _compare_name_for_result(self, other):
         return (hasattr(other, "name") and self.name == other.name) or (
             hasattr(other, "_label") and self._label == other._label
         )
 
-    @util.memoized_property
+    @util.ro_memoized_property
     def description(self) -> str:
         return self.name
 
@@ -4064,7 +4259,13 @@ class NamedColumn(ColumnElement[_T]):
     ) -> Optional[str]:
         return name
 
-    def _bind_param(self, operator, obj, type_=None, expanding=False):
+    def _bind_param(
+        self,
+        operator: OperatorType,
+        obj: Any,
+        type_: Optional[TypeEngine[_T]] = None,
+        expanding: bool = False,
+    ) -> BindParameter[_T]:
         return BindParameter(
             self.key,
             obj,
@@ -4077,12 +4278,14 @@ class NamedColumn(ColumnElement[_T]):
 
     def _make_proxy(
         self,
-        selectable,
-        name=None,
-        name_is_truncatable=False,
-        disallow_is_literal=False,
-        **kw,
-    ):
+        selectable: FromClause,
+        *,
+        name: Optional[str] = None,
+        key: Optional[str] = None,
+        name_is_truncatable: bool = False,
+        disallow_is_literal: bool = False,
+        **kw: Any,
+    ) -> typing_Tuple[str, ColumnClause[_T]]:
         c = ColumnClause(
             coercions.expect(roles.TruncatedLabelRole, name or self.name)
             if name_is_truncatable
@@ -4091,6 +4294,7 @@ class NamedColumn(ColumnElement[_T]):
             _selectable=selectable,
             is_literal=False,
         )
+
         c._propagate_attrs = selectable._propagate_attrs
         if name is None:
             c.key = self.key
@@ -4098,6 +4302,177 @@ class NamedColumn(ColumnElement[_T]):
         if selectable._is_clone_of is not None:
             c._is_clone_of = selectable._is_clone_of.columns.get(c.key)
         return c.key, c
+
+
+class Label(roles.LabeledColumnExprRole[_T], NamedColumn[_T]):
+    """Represents a column label (AS).
+
+    Represent a label, as typically applied to any column-level
+    element using the ``AS`` sql keyword.
+
+    """
+
+    __visit_name__ = "label"
+
+    _traverse_internals: _TraverseInternalsType = [
+        ("name", InternalTraversal.dp_anon_name),
+        ("type", InternalTraversal.dp_type),
+        ("_element", InternalTraversal.dp_clauseelement),
+    ]
+
+    _element: ColumnElement[_T]
+    name: str
+
+    def __init__(
+        self,
+        name: Optional[str],
+        element: _ColumnExpressionArgument[_T],
+        type_: Optional[_TypeEngineArgument[_T]] = None,
+    ):
+        orig_element = element
+        element = coercions.expect(
+            roles.ExpressionElementRole,
+            element,
+            apply_propagate_attrs=self,
+        )
+        while isinstance(element, Label):
+            # TODO: this is only covered in test_text.py, but nothing
+            # fails if it's removed.  determine rationale
+            element = element.element
+
+        if name:
+            self.name = name
+        else:
+            self.name = _anonymous_label.safe_construct(
+                id(self), getattr(element, "name", "anon")
+            )
+            if isinstance(orig_element, Label):
+                # TODO: no coverage for this block, again would be in
+                # test_text.py where the resolve_label concept is important
+                self._resolve_label = orig_element._label
+
+        self.key = self._tq_label = self._tq_key_label = self.name
+        self._element = element
+
+        self.type = (
+            type_api.to_instance(type_)
+            if type_ is not None
+            else self._element.type
+        )
+
+        self._proxies = [element]
+
+    def __reduce__(self):
+        return self.__class__, (self.name, self._element, self.type)
+
+    @HasMemoized.memoized_attribute
+    def _render_label_in_columns_clause(self):
+        return True
+
+    def _bind_param(self, operator, obj, type_=None, expanding=False):
+        return BindParameter(
+            None,
+            obj,
+            _compared_to_operator=operator,
+            type_=type_,
+            _compared_to_type=self.type,
+            unique=True,
+            expanding=expanding,
+        )
+
+    @util.memoized_property
+    def _is_implicitly_boolean(self):
+        return self.element._is_implicitly_boolean
+
+    @HasMemoized.memoized_attribute
+    def _allow_label_resolve(self):
+        return self.element._allow_label_resolve
+
+    @property
+    def _order_by_label_element(self):
+        return self
+
+    @HasMemoized.memoized_attribute
+    def element(self) -> ColumnElement[_T]:
+        return self._element.self_group(against=operators.as_)
+
+    def self_group(self, against=None):
+        return self._apply_to_inner(self._element.self_group, against=against)
+
+    def _negate(self):
+        return self._apply_to_inner(self._element._negate)
+
+    def _apply_to_inner(self, fn, *arg, **kw):
+        sub_element = fn(*arg, **kw)
+        if sub_element is not self._element:
+            return Label(self.name, sub_element, type_=self.type)
+        else:
+            return self
+
+    @property
+    def primary_key(self):
+        return self.element.primary_key
+
+    @property
+    def foreign_keys(self):
+        return self.element.foreign_keys
+
+    def _copy_internals(
+        self,
+        *,
+        clone: _CloneCallableType = _clone,
+        anonymize_labels: bool = False,
+        **kw: Any,
+    ) -> None:
+        self._reset_memoizations()
+        self._element = clone(self._element, **kw)
+        if anonymize_labels:
+            self.name = _anonymous_label.safe_construct(
+                id(self), getattr(self.element, "name", "anon")
+            )
+            self.key = self._tq_label = self._tq_key_label = self.name
+
+    @util.ro_non_memoized_property
+    def _from_objects(self) -> List[FromClause]:
+        return self.element._from_objects
+
+    def _make_proxy(
+        self,
+        selectable: FromClause,
+        *,
+        name: Optional[str] = None,
+        **kw: Any,
+    ) -> typing_Tuple[str, ColumnClause[_T]]:
+        name = self.name if not name else name
+
+        key, e = self.element._make_proxy(
+            selectable,
+            name=name,
+            disallow_is_literal=True,
+            name_is_truncatable=isinstance(name, _truncated_label),
+        )
+
+        # there was a note here to remove this assertion, which was here
+        # to determine if we later could support a use case where
+        # the key and name of a label are separate.  But I don't know what
+        # that case was.  For now, this is an unexpected case that occurs
+        # when a label name conflicts with other columns and select()
+        # is attempting to disambiguate an explicit label, which is not what
+        # the user would want.   See issue #6090.
+        if key != self.name:
+            raise exc.InvalidRequestError(
+                "Label name %s is being renamed to an anonymous label due "
+                "to disambiguation "
+                "which is not supported right now.  Please use unique names "
+                "for explicit labels." % (self.name)
+            )
+
+        e._propagate_attrs = selectable._propagate_attrs
+        e._proxies.append(self)
+        if self.type is not None:
+            e.type = self.type
+
+        return self.key, e
 
 
 class ColumnClause(
@@ -4158,10 +4533,14 @@ class ColumnClause(
 
     onupdate: Optional[DefaultGenerator] = None
     default: Optional[DefaultGenerator] = None
-    server_default: Optional[DefaultGenerator] = None
-    server_onupdate: Optional[DefaultGenerator] = None
+    server_default: Optional[_ServerDefaultType] = None
+    server_onupdate: Optional[FetchedValue] = None
 
     _is_multiparam_column = False
+
+    @property
+    def _is_star(self):
+        return self.is_literal and self.name == "*"
 
     def __init__(
         self,
@@ -4172,10 +4551,14 @@ class ColumnClause(
     ):
         self.key = self.name = text
         self.table = _selectable
-        self.type: TypeEngine[_T] = type_api.to_instance(type_)
+
+        # if type is None, we get NULLTYPE, which is our _T.  But I don't
+        # know how to get the overloads to express that correctly
+        self.type = type_api.to_instance(type_)  # type: ignore
+
         self.is_literal = is_literal
 
-    def get_children(self, column_tables=False, **kw):
+    def get_children(self, *, column_tables=False, **kw):
         # override base get_children() to not return the Table
         # or selectable that is parent to this column.  Traversals
         # expect the columns of tables and subqueries to be leaf nodes.
@@ -4201,7 +4584,7 @@ class ColumnClause(
 
         return super(ColumnClause, self)._clone(**kw)
 
-    @HasMemoized.memoized_attribute
+    @HasMemoized_ro_memoized_attribute
     def _from_objects(self) -> List[FromClause]:
         t = self.table
         if t is not None:
@@ -4297,12 +4680,14 @@ class ColumnClause(
 
     def _make_proxy(
         self,
-        selectable,
-        name=None,
-        name_is_truncatable=False,
-        disallow_is_literal=False,
-        **kw,
-    ):
+        selectable: FromClause,
+        *,
+        name: Optional[str] = None,
+        key: Optional[str] = None,
+        name_is_truncatable: bool = False,
+        disallow_is_literal: bool = False,
+        **kw: Any,
+    ) -> typing_Tuple[str, ColumnClause[_T]]:
         # the "is_literal" flag normally should never be propagated; a proxied
         # column is always a SQL identifier and never the actual expression
         # being evaluated. however, there is a case where the "is_literal" flag
@@ -4350,11 +4735,13 @@ class TableValuedColumn(NamedColumn[_T]):
         self.key = self.name = scalar_alias.name
         self.type = type_
 
-    def _copy_internals(self, clone=_clone, **kw):
+    def _copy_internals(
+        self, clone: _CloneCallableType = _clone, **kw: Any
+    ) -> None:
         self.scalar_alias = clone(self.scalar_alias, **kw)
         self.key = self.name = self.scalar_alias.name
 
-    @util.non_memoized_property
+    @util.ro_non_memoized_property
     def _from_objects(self) -> List[FromClause]:
         return [self.scalar_alias]
 
@@ -4368,9 +4755,9 @@ class CollationClause(ColumnElement[str]):
 
     @classmethod
     def _create_collation_expression(
-        cls, expression: _ColumnExpression[str], collation: str
+        cls, expression: _ColumnExpressionArgument[str], collation: str
     ) -> BinaryExpression[str]:
-        expr = coercions.expect(roles.ExpressionElementRole, expression)
+        expr = coercions.expect(roles.ExpressionElementRole[str], expression)
         return BinaryExpression(
             expr,
             CollationClause(collation),
@@ -4438,10 +4825,11 @@ class quoted_name(util.MemoizedSlots, str):
     an unconditionally quoted name::
 
         from sqlalchemy import create_engine
+        from sqlalchemy import inspect
         from sqlalchemy.sql import quoted_name
 
         engine = create_engine("oracle+cx_oracle://some_dsn")
-        engine.has_table(quoted_name("some_table", True))
+        print(inspect(engine).has_table(quoted_name("some_table", True)))
 
     The above logic will run the "has table" logic against the Oracle backend,
     passing the name exactly as ``"some_table"`` without converting to
@@ -4459,19 +4847,32 @@ class quoted_name(util.MemoizedSlots, str):
 
     quote: Optional[bool]
 
-    def __new__(cls, value, quote):
+    @overload
+    @classmethod
+    def construct(cls, value: str, quote: Optional[bool]) -> quoted_name:
+        ...
+
+    @overload
+    @classmethod
+    def construct(cls, value: None, quote: Optional[bool]) -> None:
+        ...
+
+    @classmethod
+    def construct(
+        cls, value: Optional[str], quote: Optional[bool]
+    ) -> Optional[quoted_name]:
         if value is None:
             return None
-        # experimental - don't bother with quoted_name
-        # if quote flag is None.  doesn't seem to make any dent
-        # in performance however
-        # elif not sprcls and quote is None:
-        #   return value
-        elif isinstance(value, cls) and (
-            quote is None or value.quote == quote
-        ):
+        else:
+            return quoted_name(value, quote)
+
+    def __new__(cls, value: str, quote: Optional[bool]) -> quoted_name:
+        assert (
+            value is not None
+        ), "use quoted_name.construct() for None passthrough"
+        if isinstance(value, cls) and (quote is None or value.quote == quote):
             return value
-        self = super(quoted_name, cls).__new__(cls, value)
+        self = super().__new__(cls, value)
 
         self.quote = quote
         return self
@@ -4559,7 +4960,9 @@ class AnnotatedColumnElement(Annotated):
         return self._Annotated__element.key
 
     @util.memoized_property
-    def info(self):
+    def info(self) -> _InfoType:
+        if TYPE_CHECKING:
+            assert isinstance(self._Annotated__element, Column)
         return self._Annotated__element.info
 
     @util.memoized_property
@@ -4573,15 +4976,15 @@ class _truncated_label(quoted_name):
 
     __slots__ = ()
 
-    def __new__(cls, value, quote=None):
+    def __new__(cls, value: str, quote: Optional[bool] = None) -> Any:
         quote = getattr(value, "quote", quote)
         # return super(_truncated_label, cls).__new__(cls, value, quote, True)
         return super(_truncated_label, cls).__new__(cls, value, quote)
 
-    def __reduce__(self):
+    def __reduce__(self) -> Any:
         return self.__class__, (str(self), self.quote)
 
-    def apply_map(self, map_):
+    def apply_map(self, map_: Mapping[str, Any]) -> str:
         return self
 
 

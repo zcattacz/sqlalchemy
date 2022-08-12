@@ -6,26 +6,21 @@
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
 from __future__ import annotations
 
-import typing
 from typing import Any
 from typing import Generic
-from typing import Iterable
 from typing import Optional
+from typing import TYPE_CHECKING
 from typing import TypeVar
 
 from .. import util
-from ..util import TypingOnly
 from ..util.typing import Literal
 
-if typing.TYPE_CHECKING:
+if TYPE_CHECKING:
     from ._typing import _PropagateAttrsType
-    from .base import ColumnCollection
-    from .elements import ClauseElement
-    from .elements import ColumnElement
     from .elements import Label
+    from .selectable import _SelectIterable
     from .selectable import FromClause
     from .selectable import Subquery
-
 
 _T = TypeVar("_T", bound=Any)
 
@@ -106,11 +101,19 @@ class TruncatedLabelRole(StringRole, SQLRole):
 
 class ColumnsClauseRole(AllowsLambdaRole, UsesInspection, ColumnListRole):
     __slots__ = ()
-    _role_name = "Column expression or FROM clause"
+    _role_name = (
+        "Column expression, FROM clause, or other columns clause element"
+    )
 
     @property
-    def _select_iterable(self) -> Iterable[ColumnsClauseRole]:
+    def _select_iterable(self) -> _SelectIterable:
         raise NotImplementedError()
+
+
+class TypedColumnsClauseRole(Generic[_T], SQLRole):
+    """element-typed form of ColumnsClauseRole"""
+
+    __slots__ = ()
 
 
 class LimitOffsetRole(SQLRole):
@@ -159,7 +162,13 @@ class WhereHavingRole(OnClauseRole):
     _role_name = "SQL expression for WHERE/HAVING role"
 
 
-class ExpressionElementRole(Generic[_T], SQLRole):
+class ExpressionElementRole(TypedColumnsClauseRole[_T]):
+    # note when using generics for ExpressionElementRole,
+    # the generic type needs to be in
+    # sqlalchemy.sql.coercions._impl_lookup mapping also.
+    # these are set up for basic types like int, bool, str, float
+    # right now
+
     __slots__ = ()
     _role_name = "SQL expression element"
 
@@ -202,30 +211,23 @@ class FromClauseRole(ColumnsClauseRole, JoinTargetRole):
 
     _is_subquery = False
 
-    @property
-    def _hide_froms(self) -> Iterable[FromClause]:
-        raise NotImplementedError()
+    named_with_column: bool
 
 
 class StrictFromClauseRole(FromClauseRole):
     __slots__ = ()
     # does not allow text() or select() objects
 
-    c: ColumnCollection
-
-    @property
-    def description(self) -> str:
-        raise NotImplementedError()
-
 
 class AnonymizedFromClauseRole(StrictFromClauseRole):
     __slots__ = ()
-    # calls .alias() as a post processor
 
-    def _anonymous_fromclause(
-        self, name: Optional[str] = None, flat: bool = False
-    ) -> FromClause:
-        raise NotImplementedError()
+    if TYPE_CHECKING:
+
+        def _anonymous_fromclause(
+            self, name: Optional[str] = None, flat: bool = False
+        ) -> FromClause:
+            ...
 
 
 class ReturnsRowsRole(SQLRole):
@@ -240,7 +242,14 @@ class StatementRole(SQLRole):
     __slots__ = ()
     _role_name = "Executable SQL or text() construct"
 
-    _propagate_attrs: _PropagateAttrsType = util.immutabledict()
+    if TYPE_CHECKING:
+
+        @util.memoized_property
+        def _propagate_attrs(self) -> _PropagateAttrsType:
+            ...
+
+    else:
+        _propagate_attrs = util.EMPTY_DICT
 
 
 class SelectStatementRole(StatementRole, ReturnsRowsRole):
@@ -313,36 +322,3 @@ class DDLReferredColumnRole(DDLConstraintColumnRole):
     _role_name = (
         "String column name or Column object for DDL foreign key constraint"
     )
-
-
-class HasClauseElement(TypingOnly):
-    """indicates a class that has a __clause_element__() method"""
-
-    __slots__ = ()
-
-    if typing.TYPE_CHECKING:
-
-        def __clause_element__(self) -> ClauseElement:
-            ...
-
-
-class HasColumnElementClauseElement(TypingOnly):
-    """indicates a class that has a __clause_element__() method"""
-
-    __slots__ = ()
-
-    if typing.TYPE_CHECKING:
-
-        def __clause_element__(self) -> ColumnElement[Any]:
-            ...
-
-
-class HasFromClauseElement(HasClauseElement, TypingOnly):
-    """indicates a class that has a __clause_element__() method"""
-
-    __slots__ = ()
-
-    if typing.TYPE_CHECKING:
-
-        def __clause_element__(self) -> FromClause:
-            ...

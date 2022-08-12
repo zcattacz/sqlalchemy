@@ -72,7 +72,9 @@ from sqlalchemy.sql import null
 from sqlalchemy.sql import operators
 from sqlalchemy.sql import sqltypes
 from sqlalchemy.sql import table
+from sqlalchemy.sql import type_api
 from sqlalchemy.sql import visitors
+from sqlalchemy.sql.compiler import TypeCompiler
 from sqlalchemy.sql.sqltypes import TypeEngine
 from sqlalchemy.testing import assert_raises
 from sqlalchemy.testing import assert_raises_message
@@ -81,7 +83,6 @@ from sqlalchemy.testing import AssertsExecutionResults
 from sqlalchemy.testing import engines
 from sqlalchemy.testing import eq_
 from sqlalchemy.testing import expect_raises
-from sqlalchemy.testing import expect_warnings
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import is_
 from sqlalchemy.testing import is_not
@@ -92,6 +93,7 @@ from sqlalchemy.testing.schema import Column
 from sqlalchemy.testing.schema import pep435_enum
 from sqlalchemy.testing.schema import Table
 from sqlalchemy.testing.util import picklers
+from sqlalchemy.types import UserDefinedType
 
 
 def _all_dialect_modules():
@@ -109,7 +111,11 @@ def _all_dialects():
 def _types_for_mod(mod):
     for key in dir(mod):
         typ = getattr(mod, key)
-        if not isinstance(typ, type) or not issubclass(typ, types.TypeEngine):
+        if (
+            not isinstance(typ, type)
+            or not issubclass(typ, types.TypeEngine)
+            or typ.__dict__.get("__abstract__")
+        ):
             continue
         yield typ
 
@@ -117,10 +123,15 @@ def _types_for_mod(mod):
 def _all_types(omit_special_types=False):
     seen = set()
     for typ in _types_for_mod(types):
-        if omit_special_types and typ in (
-            types.TypeDecorator,
-            types.TypeEngine,
-            types.Variant,
+        if omit_special_types and (
+            typ
+            in (
+                TypeEngine,
+                type_api.TypeEngineMixin,
+                types.Variant,
+                types.TypeDecorator,
+            )
+            or type_api.TypeEngineMixin in typ.__bases__
         ):
             continue
 
@@ -134,6 +145,17 @@ def _all_types(omit_special_types=False):
                 continue
             seen.add(typ)
             yield typ
+
+
+def _get_instance(type_):
+    if issubclass(type_, ARRAY):
+        return type_(String)
+    elif hasattr(type_, "__test_init__"):
+        t1 = type_.__test_init__()
+        is_(isinstance(t1, type_), True)
+        return t1
+    else:
+        return type_()
 
 
 class AdaptTest(fixtures.TestBase):
@@ -233,11 +255,8 @@ class AdaptTest(fixtures.TestBase):
         adapt() beyond their defaults.
 
         """
+        t1 = _get_instance(typ)
 
-        if issubclass(typ, ARRAY):
-            t1 = typ(String)
-        else:
-            t1 = typ()
         for cls in target_adaptions:
             if (is_down_adaption and issubclass(typ, sqltypes.Emulated)) or (
                 not is_down_adaption and issubclass(cls, sqltypes.Emulated)
@@ -294,19 +313,13 @@ class AdaptTest(fixtures.TestBase):
     @testing.uses_deprecated()
     @testing.combinations(*[(t,) for t in _all_types(omit_special_types=True)])
     def test_repr(self, typ):
-        if issubclass(typ, ARRAY):
-            t1 = typ(String)
-        else:
-            t1 = typ()
+        t1 = _get_instance(typ)
         repr(t1)
 
     @testing.uses_deprecated()
     @testing.combinations(*[(t,) for t in _all_types(omit_special_types=True)])
     def test_str(self, typ):
-        if issubclass(typ, ARRAY):
-            t1 = typ(String)
-        else:
-            t1 = typ()
+        t1 = _get_instance(typ)
         str(t1)
 
     def test_str_third_party(self):
@@ -374,14 +387,14 @@ class TypeAffinityTest(fixtures.TestBase):
 
             def load_dialect_impl(self, dialect):
                 if dialect.name == "postgresql":
-                    return dialect.type_descriptor(postgresql.UUID())
+                    return dialect.type_descriptor(postgresql.INET())
                 else:
                     return dialect.type_descriptor(CHAR(32))
 
         t1 = MyType()
         d = postgresql.dialect()
         assert t1._type_affinity is String
-        assert t1.dialect_impl(d)._type_affinity is postgresql.UUID
+        assert t1.dialect_impl(d)._type_affinity is postgresql.INET
 
 
 class AsGenericTest(fixtures.TestBase):
@@ -393,7 +406,7 @@ class AsGenericTest(fixtures.TestBase):
         (pg.JSON(), sa.JSON()),
         (pg.ARRAY(sa.String), sa.ARRAY(sa.String)),
         (Enum("a", "b", "c"), Enum("a", "b", "c")),
-        (pg.ENUM("a", "b", "c"), Enum("a", "b", "c")),
+        (pg.ENUM("a", "b", "c", name="pgenum"), Enum("a", "b", "c")),
         (mysql.ENUM("a", "b", "c"), Enum("a", "b", "c")),
         (pg.INTERVAL(precision=5), Interval(native=True, second_precision=5)),
         (
@@ -412,11 +425,7 @@ class AsGenericTest(fixtures.TestBase):
         ]
     )
     def test_as_generic_all_types_heuristic(self, type_):
-        if issubclass(type_, ARRAY):
-            t1 = type_(String)
-        else:
-            t1 = type_()
-
+        t1 = _get_instance(type_)
         try:
             gentype = t1.as_generic()
         except NotImplementedError:
@@ -438,10 +447,7 @@ class AsGenericTest(fixtures.TestBase):
         ]
     )
     def test_as_generic_all_types_custom(self, type_):
-        if issubclass(type_, ARRAY):
-            t1 = type_(String)
-        else:
-            t1 = type_()
+        t1 = _get_instance(type_)
 
         gentype = t1.as_generic(allow_nulltype=False)
         assert isinstance(gentype, TypeEngine)
@@ -774,6 +780,136 @@ class UserDefinedRoundTripTest(_UserDefinedTypeFixture, fixtures.TablesTest):
         )
         result = connection.execute(stmt, {"goofy": [15, 9]})
         eq_(result.fetchall(), [(3, 1500), (4, 900)])
+
+
+class TypeDecoratorSpecialCasesTest(AssertsCompiledSQL, fixtures.TestBase):
+    __backend__ = True
+
+    @testing.requires.array_type
+    def test_typedec_of_array_modified(self, metadata, connection):
+        """test #7249"""
+
+        class SkipsFirst(TypeDecorator):  # , Indexable):
+            impl = ARRAY(Integer, zero_indexes=True)
+
+            cache_ok = True
+
+            def process_bind_param(self, value, dialect):
+                return value[1:]
+
+            def copy(self, **kw):
+                return SkipsFirst(**kw)
+
+            def coerce_compared_value(self, op, value):
+                return self.impl.coerce_compared_value(op, value)
+
+        t = Table(
+            "t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", SkipsFirst),
+        )
+        t.create(connection)
+
+        connection.execute(t.insert(), {"data": [1, 2, 3]})
+        val = connection.scalar(select(t.c.data))
+        eq_(val, [2, 3])
+
+        val = connection.scalar(select(t.c.data[0]))
+        eq_(val, 2)
+
+    def test_typedec_of_array_ops(self):
+        class ArrayDec(TypeDecorator):
+            impl = ARRAY(Integer, zero_indexes=True)
+
+            cache_ok = True
+
+            def coerce_compared_value(self, op, value):
+                return self.impl.coerce_compared_value(op, value)
+
+        expr1 = column("q", ArrayDec)[0]
+        expr2 = column("q", ARRAY(Integer, zero_indexes=True))[0]
+
+        eq_(expr1.right.type._type_affinity, Integer)
+        eq_(expr2.right.type._type_affinity, Integer)
+
+        self.assert_compile(
+            column("q", ArrayDec).any(7, operator=operators.lt),
+            "%(q_1)s < ANY (q)",
+            dialect="postgresql",
+        )
+
+        self.assert_compile(
+            column("q", ArrayDec)[5], "q[%(q_1)s]", dialect="postgresql"
+        )
+
+    def test_typedec_of_json_ops(self):
+        class JsonDec(TypeDecorator):
+            impl = JSON()
+
+            cache_ok = True
+
+        self.assert_compile(
+            column("q", JsonDec)["q"], "q -> %(q_1)s", dialect="postgresql"
+        )
+
+        self.assert_compile(
+            column("q", JsonDec)["q"].as_integer(),
+            "CAST(q ->> %(q_1)s AS INTEGER)",
+            dialect="postgresql",
+        )
+
+    @testing.requires.array_type
+    def test_typedec_of_array(self, metadata, connection):
+        """test #7249"""
+
+        class ArrayDec(TypeDecorator):
+            impl = ARRAY(Integer, zero_indexes=True)
+
+            cache_ok = True
+
+            def coerce_compared_value(self, op, value):
+                return self.impl.coerce_compared_value(op, value)
+
+        t = Table(
+            "t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", ArrayDec),
+        )
+
+        t.create(connection)
+
+        connection.execute(t.insert(), {"data": [1, 2, 3]})
+        val = connection.scalar(select(t.c.data))
+        eq_(val, [1, 2, 3])
+
+        val = connection.scalar(select(t.c.data[0]))
+        eq_(val, 1)
+
+    @testing.requires.json_type
+    def test_typedec_of_json(self, metadata, connection):
+        """test #7249"""
+
+        class JsonDec(TypeDecorator):
+            impl = JSON()
+
+            cache_ok = True
+
+        t = Table(
+            "t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", JsonDec),
+        )
+        t.create(connection)
+
+        connection.execute(t.insert(), {"data": {"key": "value"}})
+        val = connection.scalar(select(t.c.data))
+        eq_(val, {"key": "value"})
+
+        val = connection.scalar(select(t.c.data["key"].as_string()))
+        eq_(val, "value")
 
 
 class BindProcessorInsertValuesTest(UserDefinedRoundTripTest):
@@ -1509,9 +1645,15 @@ class VariantTest(fixtures.TestBase, AssertsCompiledSQL):
         self.UTypeTwo = UTypeTwo
         self.UTypeThree = UTypeThree
         self.variant = self.UTypeOne().with_variant(
-            self.UTypeTwo(), "postgresql"
+            self.UTypeTwo(), "postgresql", "mssql"
         )
         self.composite = self.variant.with_variant(self.UTypeThree(), "mysql")
+
+    def test_one_dialect_is_req(self):
+        with expect_raises_message(
+            exc.ArgumentError, "At least one dialect name is required"
+        ):
+            String().with_variant(VARCHAR())
 
     def test_illegal_dupe(self):
         v = self.UTypeOne().with_variant(self.UTypeTwo(), "postgresql")
@@ -1540,6 +1682,9 @@ class VariantTest(fixtures.TestBase, AssertsCompiledSQL):
 
         self.assert_compile(
             self.variant, "UTYPETWO", dialect=dialects.postgresql.dialect()
+        )
+        self.assert_compile(
+            self.variant, "UTYPETWO", dialect=dialects.mssql.dialect()
         )
 
     def test_to_instance(self):
@@ -2387,17 +2532,25 @@ class EnumTest(AssertsCompiledSQL, fixtures.TablesTest):
         eq_(e1_vc.adapt(ENUM).name, "someotherenum")
         eq_(e1_vc.adapt(ENUM).enums, ["1", "2", "3", "a", "b"])
 
-    def test_adapt_length(self):
+    @testing.combinations(True, False, argnames="native_enum")
+    def test_adapt_length(self, native_enum):
         from sqlalchemy.dialects.postgresql import ENUM
 
-        e1 = Enum("one", "two", "three", length=50, native_enum=False)
-        eq_(e1.adapt(ENUM).length, 50)
+        e1 = Enum("one", "two", "three", length=50, native_enum=native_enum)
+
+        if not native_enum:
+            eq_(e1.adapt(ENUM).length, 50)
+
         eq_(e1.adapt(Enum).length, 50)
+
+        self.assert_compile(e1, "VARCHAR(50)", dialect="default")
 
         e1 = Enum("one", "two", "three")
         eq_(e1.length, 5)
         eq_(e1.adapt(ENUM).length, 5)
         eq_(e1.adapt(Enum).length, 5)
+
+        self.assert_compile(e1, "VARCHAR(5)", dialect="default")
 
     @testing.provide_metadata
     def test_create_metadata_bound_no_crash(self):
@@ -2495,32 +2648,20 @@ class EnumTest(AssertsCompiledSQL, fixtures.TablesTest):
         )
 
     def test_repr_four(self):
-        with expect_warnings(
-            "Enum 'length' argument is currently ignored unless native_enum"
-        ):
-            e = Enum("x", "y", length=255)
-        # length is currently ignored if native_enum is not False
+        e = Enum("x", "y", length=255)
         eq_(
             repr(e),
-            "Enum('x', 'y')",
+            "Enum('x', 'y', length=255)",
         )
 
     def test_length_native(self):
-        with expect_warnings(
-            "Enum 'length' argument is currently ignored unless native_enum"
-        ):
-            e = Enum("x", "y", "long", length=42)
+        e = Enum("x", "y", "long", length=42)
+        eq_(e.length, 42)
 
+        e = Enum("x", "y", "long")
         eq_(e.length, len("long"))
 
-        # no error is raised
-        with expect_warnings(
-            "Enum 'length' argument is currently ignored unless native_enum"
-        ):
-            e = Enum("x", "y", "long", length=1)
-        eq_(e.length, len("long"))
-
-    def test_length_raises(self):
+    def test_length_too_short_raises(self):
         assert_raises_message(
             ValueError,
             "When provided, length must be larger or equal.*",
@@ -2902,7 +3043,7 @@ class JSONTest(fixtures.TestBase):
         eq_(bindproc(expr.right.value), "'five'")
 
 
-class ArrayTest(fixtures.TestBase):
+class ArrayTest(AssertsCompiledSQL, fixtures.TestBase):
     def _myarray_fixture(self):
         class MyArray(ARRAY):
             pass
@@ -2954,6 +3095,44 @@ class ArrayTest(fixtures.TestBase):
         # but the slice returns the actual type
         assert isinstance(arrtable.c.intarr[1:3].type, MyArray)
         assert isinstance(arrtable.c.strarr[1:3].type, MyArray)
+
+    def test_array_literal_simple(self):
+        self.assert_compile(
+            select(literal([1, 2, 3], ARRAY(Integer))),
+            "SELECT [1, 2, 3] AS anon_1",
+            literal_binds=True,
+            dialect="default",
+        )
+
+    def test_array_literal_complex(self):
+        self.assert_compile(
+            select(
+                literal(
+                    [["one", "two"], ["thr'ee", "réve🐍 illé"]],
+                    ARRAY(String, dimensions=2),
+                )
+            ),
+            "SELECT [['one', 'two'], ['thr''ee', 'réve🐍 illé']] AS anon_1",
+            literal_binds=True,
+            dialect="default",
+        )
+
+    def test_array_literal_render_no_inner_render(self):
+        class MyType(UserDefinedType):
+            cache_ok = True
+
+            def get_col_spec(self, **kw):
+                return "MYTYPE"
+
+        with expect_raises_message(
+            NotImplementedError,
+            r"Don't know how to literal-quote value \[1, 2, 3\]",
+        ):
+            self.assert_compile(
+                select(literal([1, 2, 3], ARRAY(MyType()))),
+                "nothing",
+                literal_binds=True,
+            )
 
 
 MyCustomType = MyTypeDec = None
@@ -3553,7 +3732,7 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
                 return "MYINTEGER %s" % kw["type_expression"].name
 
         dialect = default.DefaultDialect()
-        dialect.type_compiler = SomeTypeCompiler(dialect)
+        dialect.type_compiler_instance = SomeTypeCompiler(dialect)
         self.assert_compile(
             ddl.CreateColumn(Column("bar", VARCHAR(50))),
             "bar MYVARCHAR",
@@ -3564,6 +3743,34 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
             "bar MYINTEGER bar",
             dialect=dialect,
         )
+
+    def test_legacy_typecompiler_attribute(self):
+        """the .type_compiler attribute was broken into
+        .type_compiler_cls and .type_compiler_instance for 2.0 so that it can
+        be properly typed.  However it is expected that the majority of
+        dialects make use of the .type_compiler attribute both at the class
+        level as well as the instance level, so make sure it still functions
+        in exactly the same way, both as the type compiler class to be
+        used as well as that it's present as an instance on an instance
+        of the dialect.
+
+        """
+
+        dialect = default.DefaultDialect()
+        assert isinstance(
+            dialect.type_compiler_instance, dialect.type_compiler_cls
+        )
+        is_(dialect.type_compiler_instance, dialect.type_compiler)
+
+        class MyTypeCompiler(TypeCompiler):
+            pass
+
+        class MyDialect(default.DefaultDialect):
+            type_compiler = MyTypeCompiler
+
+        dialect = MyDialect()
+        assert isinstance(dialect.type_compiler_instance, MyTypeCompiler)
+        is_(dialect.type_compiler_instance, dialect.type_compiler)
 
 
 class TestKWArgPassThru(AssertsCompiledSQL, fixtures.TestBase):
